@@ -1,0 +1,20 @@
+App(
+    appid="settings",
+    name="Settings",
+    # SYSTEM, not MENUEXTERNAL: this is the Settings tree, opened from the main
+    # menu's Settings entry and the Control Center by appid. As a menu app it
+    # also showed up as a separate menu item in the menu editor and pickers.
+    apptype=NetrunnerAppType.SYSTEM,
+    entry_point="settings_app",
+    requires=[
+        "desktop",
+        "gui",
+        "power",
+        "storage",
+    ],
+    stack_size=4 * 1024,
+    flags=["InsomniaSafe"],
+    icon="A_Settings_14",
+    order=90,
+    fap_category="assets",
+)

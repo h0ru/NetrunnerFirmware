@@ -1,0 +1,7 @@
+idf_component_register(
+    SRCS
+        "ble_serial.c"
+    INCLUDE_DIRS "."
+    REQUIRES bt nimble_glue
+    PRIV_REQUIRES nvs_flash furi_ble furi_hal netrunner_protobuf datetime
+)

@@ -1,0 +1,9 @@
+# Python packages the build/tooling needs that are NOT bundled with ESP-IDF.
+# Install into the ESP-IDF virtualenv:
+#     source ~/esp/esp-idf/export.sh
+#     pip install -r requirements.txt
+#
+# Pillow (PIL) is used by tools/fam/compile_icons.py (firmware icon assets) and
+# tools/fap_manifest.py (FAP icons). Without it the build fails at the icon
+# generation step with "ModuleNotFoundError: No module named 'PIL'".
+Pillow>=9.0

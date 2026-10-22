@@ -1,0 +1,770 @@
+#include <gui/view_stack.h>
+#include <stdint.h>
+#include <furi.h>
+#include <furi_hal.h>
+#include <dolphin/dolphin.h>
+#include <power/power_service/power.h>
+#include <storage/storage.h>
+#include <assets_icons.h>
+
+#include "views/bubble_animation_view.h"
+#include "views/one_shot_animation_view.h"
+#include "animation_storage.h"
+#include "animation_manager.h"
+#include <netrunner/netrunner.h>
+
+#define TAG "AnimationManager"
+
+#define HARDCODED_ANIMATION_NAME   "Netrunner_128x64"
+#define NO_SD_ANIMATION_NAME       "L1_NoSd_128x49"
+#define BAD_BATTERY_ANIMATION_NAME "L1_BadBattery_128x47"
+
+/* The OFW SD-card blocking screens (L0_SdBad "Mounting SD card Failed",
+ * L0_SdOk, L0_NoDb, L0_Url) are intentionally never shown: the desktop always
+ * opens on the Netrunner animation whether or not a card is inserted. Apps that
+ * need the card report its absence themselves when they are opened. */
+#define NEW_MAIL_ANIMATION_NAME "L0_NewMail_128x51"
+
+/* OFW animation metadata keeps one scene selected for several minutes. That is
+ * useful on the original always-on display, but looks stuck on this port. Keep
+ * explicit Cycle Anims settings intact and only bound the Meta.txt default. */
+#define DEFAULT_IDLE_ANIMATION_CYCLE_SECONDS 30U
+
+/* How long the compiled-in Netrunner boot animation stays before the normal idle
+ * rotation takes over, used only when animation cycling is turned off
+ * (cycle_anims < 0). It has to hand off once regardless of that setting, or a
+ * selected asset pack would never appear and the desktop would sit on Netrunner
+ * forever. Long enough to play the boot animation through once. */
+#define BOOT_ANIMATION_LINGER_SECONDS 10U
+
+typedef enum {
+    AnimationManagerStateIdle,
+    AnimationManagerStateBlocked,
+    AnimationManagerStateFreezedIdle,
+    AnimationManagerStateFreezedBlocked,
+} AnimationManagerState;
+
+struct AnimationManager {
+    AnimationManagerState state;
+    FuriPubSubSubscription* pubsub_subscription_storage;
+    FuriPubSubSubscription* pubsub_subscription_dolphin;
+    BubbleAnimationView* animation_view;
+    OneShotView* one_shot_view;
+    FuriTimer* idle_animation_timer;
+    StorageAnimation* current_animation;
+    AnimationManagerInteractCallback interact_callback;
+    AnimationManagerSetNewIdleAnimationCallback new_idle_callback;
+    AnimationManagerSetNewIdleAnimationCallback check_blocking_callback;
+    void* context;
+    FuriString* freezed_animation_name;
+    int32_t freezed_animation_time_left;
+    uint32_t freezed_settings_revision;
+    ViewStack* view_stack;
+
+    /* Boot-time retries left for landing on a pinned wallpaper whose SD asset
+     * pack was not readable yet at the idle hand-off (0 = not retrying). */
+    uint8_t wallpaper_retry;
+
+    bool dummy_mode     : 1;
+    bool levelup_pending : 1;
+    bool levelup_active  : 1;
+};
+
+static StorageAnimation*
+    animation_manager_select_idle_animation(AnimationManager* animation_manager);
+static void animation_manager_replace_current_animation(
+    AnimationManager* animation_manager,
+    StorageAnimation* storage_animation);
+static void animation_manager_start_new_idle(AnimationManager* animation_manager);
+static bool animation_manager_check_blocking(AnimationManager* animation_manager);
+static bool animation_manager_is_valid_idle_animation(
+    const StorageAnimationManifestInfo* info,
+    const DolphinStats* stats);
+static void animation_manager_switch_to_one_shot_view(AnimationManager* animation_manager);
+static void animation_manager_switch_to_animation_view(AnimationManager* animation_manager);
+
+static void animation_manager_arm_idle_timer(
+    AnimationManager* animation_manager,
+    const BubbleAnimation* animation,
+    uint32_t remaining_ticks) {
+    furi_assert(animation_manager);
+    furi_assert(animation);
+
+    furi_timer_stop(animation_manager->idle_animation_timer);
+
+    uint32_t metadata_duration_seconds = animation->duration;
+    if((netrunner_settings.cycle_anims == 0) &&
+       (metadata_duration_seconds > DEFAULT_IDLE_ANIMATION_CYCLE_SECONDS)) {
+        metadata_duration_seconds = DEFAULT_IDLE_ANIMATION_CYCLE_SECONDS;
+    }
+
+    bool enabled = false;
+    uint32_t period_ms = netrunner_animation_cycle_period_ms(
+        netrunner_settings.cycle_anims, metadata_duration_seconds, &enabled);
+    if(!enabled) return;
+
+    if(period_ms >= UINT32_MAX) period_ms = UINT32_MAX - 1U;
+    uint32_t period_ticks = remaining_ticks ? remaining_ticks : furi_ms_to_ticks(period_ms);
+    if(period_ticks == 0) period_ticks = 1;
+
+    furi_timer_start(animation_manager->idle_animation_timer, period_ticks);
+}
+
+void animation_manager_set_context(AnimationManager* animation_manager, void* context) {
+    furi_assert(animation_manager);
+    animation_manager->context = context;
+}
+
+void animation_manager_set_new_idle_callback(
+    AnimationManager* animation_manager,
+    AnimationManagerSetNewIdleAnimationCallback callback) {
+    furi_assert(animation_manager);
+    animation_manager->new_idle_callback = callback;
+}
+
+void animation_manager_set_check_callback(
+    AnimationManager* animation_manager,
+    AnimationManagerCheckBlockingCallback callback) {
+    furi_assert(animation_manager);
+    animation_manager->check_blocking_callback = callback;
+}
+
+void animation_manager_set_interact_callback(
+    AnimationManager* animation_manager,
+    AnimationManagerInteractCallback callback) {
+    furi_assert(animation_manager);
+    animation_manager->interact_callback = callback;
+}
+
+void animation_manager_set_dummy_mode_state(AnimationManager* animation_manager, bool enabled) {
+    furi_assert(animation_manager);
+    // Prevent change of animations if mode is the same
+    if(animation_manager->dummy_mode != enabled) {
+        animation_manager->dummy_mode = enabled;
+        animation_manager_start_new_idle(animation_manager);
+    }
+}
+
+static void animation_manager_storage_callback(const void* message, void* context) {
+    const StorageEvent* storage_event = message;
+
+    switch(storage_event->type) {
+    /* Re-validate the idle animation when the card (and with it an asset pack)
+     * appears or disappears. A mount error is deliberately ignored: no card is
+     * a normal state on this board, not something the desktop reacts to. */
+    case StorageEventTypeCardMount:
+    case StorageEventTypeCardUnmount:
+        furi_assert(context);
+        AnimationManager* animation_manager = context;
+        if(animation_manager->check_blocking_callback) {
+            animation_manager->check_blocking_callback(animation_manager->context);
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+static void animation_manager_dolphin_callback(const void* message, void* context) {
+    const DolphinPubsubEvent* dolphin_event = message;
+
+    switch(*dolphin_event) {
+    case DolphinPubsubEventUpdate:
+        furi_assert(context);
+        AnimationManager* animation_manager = context;
+        if(animation_manager->check_blocking_callback) {
+            animation_manager->check_blocking_callback(animation_manager->context);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void animation_manager_timer_callback(void* context) {
+    furi_assert(context);
+    AnimationManager* animation_manager = context;
+    if(animation_manager->new_idle_callback) {
+        animation_manager->new_idle_callback(animation_manager->context);
+    }
+}
+
+static void animation_manager_interact_callback(void* context) {
+    furi_assert(context);
+    AnimationManager* animation_manager = context;
+    if(animation_manager->interact_callback) {
+        animation_manager->interact_callback(animation_manager->context);
+    }
+}
+
+/* reaction to animation_manager->check_blocking_callback() */
+void animation_manager_check_blocking_process(AnimationManager* animation_manager) {
+    furi_assert(animation_manager);
+
+    if(animation_manager->state == AnimationManagerStateIdle) {
+        bool blocked = animation_manager_check_blocking(animation_manager);
+
+        if(!blocked) {
+            Dolphin* dolphin = furi_record_open(RECORD_DOLPHIN);
+            DolphinStats stats = dolphin_stats(dolphin);
+            furi_record_close(RECORD_DOLPHIN);
+
+            const StorageAnimationManifestInfo* manifest_info =
+                animation_storage_get_meta(animation_manager->current_animation);
+            bool valid = animation_manager_is_valid_idle_animation(manifest_info, &stats);
+            /* The boot animation stays until its idle timer rotates it out. */
+            if(!strcmp(manifest_info->name, HARDCODED_ANIMATION_NAME)) valid = true;
+
+            if(!valid) {
+                animation_manager_start_new_idle(animation_manager);
+            }
+        }
+    }
+}
+
+/* reaction to animation_manager->new_idle_callback() */
+void animation_manager_new_idle_process(AnimationManager* animation_manager) {
+    furi_assert(animation_manager);
+
+    if(animation_manager->state == AnimationManagerStateIdle) {
+        animation_manager_start_new_idle(animation_manager);
+    }
+}
+
+/* reaction to animation_manager->interact_callback() */
+bool animation_manager_interact_process(AnimationManager* animation_manager) {
+    furi_assert(animation_manager);
+    bool consumed = true;
+
+    if(animation_manager->levelup_pending) {
+        animation_manager->levelup_pending = false;
+        bubble_animation_view_set_interact_pending(animation_manager->animation_view, false);
+        animation_manager->levelup_active = true;
+        animation_manager_switch_to_one_shot_view(animation_manager);
+        Dolphin* dolphin = furi_record_open(RECORD_DOLPHIN);
+        dolphin_upgrade_level(dolphin);
+        furi_record_close(RECORD_DOLPHIN);
+    } else if(animation_manager->levelup_active) {
+        animation_manager->levelup_active = false;
+        animation_manager_start_new_idle(animation_manager);
+        animation_manager_switch_to_animation_view(animation_manager);
+    } else if(animation_manager->state == AnimationManagerStateBlocked) {
+        bool blocked = animation_manager_check_blocking(animation_manager);
+
+        if(!blocked) {
+            animation_manager_start_new_idle(animation_manager);
+        }
+    } else {
+        consumed = false;
+    }
+
+    return consumed;
+}
+
+static void animation_manager_start_new_idle(AnimationManager* animation_manager) {
+    furi_assert(animation_manager);
+
+    StorageAnimation* new_animation = animation_manager_select_idle_animation(animation_manager);
+    animation_manager_replace_current_animation(animation_manager, new_animation);
+    const BubbleAnimation* bubble_animation =
+        animation_storage_get_bubble_animation(animation_manager->current_animation);
+    animation_manager->state = AnimationManagerStateIdle;
+    animation_manager_arm_idle_timer(animation_manager, bubble_animation, 0);
+
+    /* Self-heal the pinned-wallpaper case. The boot idle hand-off runs once and,
+     * with cycling off, does not re-fire; if the chosen wallpaper lives on an SD
+     * asset pack that was not readable yet (card still mounting), selection falls
+     * back to a default and the desktop would stay there until the user leaves
+     * and re-enters the main screen. When a wallpaper is pinned but we did not
+     * land on it, re-arm a short retry so selection runs again until the pack
+     * becomes readable; stop as soon as the wallpaper is shown (or retries run
+     * out, so a genuinely missing pack cannot spin forever). */
+    if(!netrunner_settings.unlock_anims && netrunner_settings.wallpaper[0]) {
+        const char* shown =
+            animation_storage_get_meta(animation_manager->current_animation)->name;
+        if(strcmp(shown, netrunner_settings.wallpaper) != 0) {
+            if(animation_manager->wallpaper_retry < 20) {
+                animation_manager->wallpaper_retry++;
+                furi_timer_stop(animation_manager->idle_animation_timer);
+                furi_timer_start(
+                    animation_manager->idle_animation_timer, furi_ms_to_ticks(1500));
+            }
+        } else {
+            animation_manager->wallpaper_retry = 0; /* landed on the wallpaper */
+        }
+    }
+}
+
+static bool animation_manager_check_blocking(AnimationManager* animation_manager) {
+    furi_assert(animation_manager);
+
+    /* The only blocking screen left is the level-up mail; SD card state never
+     * blocks the desktop (see the note at NEW_MAIL_ANIMATION_NAME). */
+    StorageAnimation* blocking_animation = NULL;
+
+    Dolphin* dolphin = furi_record_open(RECORD_DOLPHIN);
+    DolphinStats stats = dolphin_stats(dolphin);
+    furi_record_close(RECORD_DOLPHIN);
+    if(!blocking_animation && stats.level_up_is_pending) {
+        blocking_animation = animation_storage_find_animation(NEW_MAIL_ANIMATION_NAME);
+        furi_check(blocking_animation);
+        animation_manager->levelup_pending = true;
+        /* Tell the view a long OK now means "claim this", since Right is not
+         * reachable on this board. */
+        bubble_animation_view_set_interact_pending(animation_manager->animation_view, true);
+    }
+
+    if(blocking_animation) {
+        furi_timer_stop(animation_manager->idle_animation_timer);
+        animation_manager_replace_current_animation(animation_manager, blocking_animation);
+        /* no timer starting because this is blocking animation */
+        animation_manager->state = AnimationManagerStateBlocked;
+    }
+
+    return !!blocking_animation;
+}
+
+static void animation_manager_replace_current_animation(
+    AnimationManager* animation_manager,
+    StorageAnimation* storage_animation) {
+    furi_assert(storage_animation);
+    StorageAnimation* previous_animation = animation_manager->current_animation;
+
+    const BubbleAnimation* animation = animation_storage_get_bubble_animation(storage_animation);
+    bubble_animation_view_set_animation(animation_manager->animation_view, animation);
+    const char* new_name = animation_storage_get_meta(storage_animation)->name;
+    FURI_LOG_I(TAG, "Select \'%s\' animation", new_name);
+    animation_manager->current_animation = storage_animation;
+
+    if(previous_animation) {
+        animation_storage_free_storage_animation(&previous_animation);
+    }
+}
+
+AnimationManager* animation_manager_alloc(void) {
+    AnimationManager* animation_manager = malloc(sizeof(AnimationManager));
+    animation_manager->animation_view = bubble_animation_view_alloc();
+    animation_manager->view_stack = view_stack_alloc();
+    View* animation_view = bubble_animation_get_view(animation_manager->animation_view);
+    view_stack_add_view(animation_manager->view_stack, animation_view);
+    animation_manager->freezed_animation_name = furi_string_alloc();
+    animation_manager->wallpaper_retry = 0;
+
+    animation_manager->idle_animation_timer =
+        furi_timer_alloc(animation_manager_timer_callback, FuriTimerTypeOnce, animation_manager);
+    bubble_animation_view_set_interact_callback(
+        animation_manager->animation_view, animation_manager_interact_callback, animation_manager);
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    animation_manager->pubsub_subscription_storage = furi_pubsub_subscribe(
+        storage_get_pubsub(storage), animation_manager_storage_callback, animation_manager);
+    furi_record_close(RECORD_STORAGE);
+
+    Dolphin* dolphin = furi_record_open(RECORD_DOLPHIN);
+    animation_manager->pubsub_subscription_dolphin = furi_pubsub_subscribe(
+        dolphin_get_pubsub(dolphin), animation_manager_dolphin_callback, animation_manager);
+    furi_record_close(RECORD_DOLPHIN);
+
+    /* Boot always opens on the compiled-in Netrunner animation, independent of
+     * the SD card, asset packs and Dolphin state. The normal idle rotation (and
+     * a pending level-up mail) takes over on the next idle timer, Dolphin
+     * update or return to the desktop. */
+    StorageAnimation* boot_animation = animation_storage_find_animation(HARDCODED_ANIMATION_NAME);
+    furi_check(boot_animation);
+    animation_manager_replace_current_animation(animation_manager, boot_animation);
+    animation_manager->state = AnimationManagerStateIdle;
+    animation_manager_arm_idle_timer(
+        animation_manager, animation_storage_get_bubble_animation(boot_animation), 0);
+
+    /* arm_idle_timer honours the cycle setting and does nothing when cycling is
+     * off (cycle_anims < 0). The boot animation must still hand off once in that
+     * case, otherwise a selected asset pack never gets a chance to show and the
+     * desktop is stuck on Netrunner. Arm a one-shot linger so idle selection runs
+     * once; from then on arm_idle_timer's normal (disabled) behaviour keeps the
+     * chosen asset-pack animation on screen without further cycling. */
+    if(!furi_timer_is_running(animation_manager->idle_animation_timer)) {
+        uint32_t ticks = furi_ms_to_ticks(BOOT_ANIMATION_LINGER_SECONDS * 1000U);
+        furi_timer_start(animation_manager->idle_animation_timer, ticks ? ticks : 1);
+    }
+
+    return animation_manager;
+}
+
+void animation_manager_free(AnimationManager* animation_manager) {
+    furi_assert(animation_manager);
+
+    Dolphin* dolphin = furi_record_open(RECORD_DOLPHIN);
+    furi_pubsub_unsubscribe(
+        dolphin_get_pubsub(dolphin), animation_manager->pubsub_subscription_dolphin);
+    furi_record_close(RECORD_DOLPHIN);
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    furi_pubsub_unsubscribe(
+        storage_get_pubsub(storage), animation_manager->pubsub_subscription_storage);
+    furi_record_close(RECORD_STORAGE);
+
+    furi_string_free(animation_manager->freezed_animation_name);
+    View* animation_view = bubble_animation_get_view(animation_manager->animation_view);
+    view_stack_remove_view(animation_manager->view_stack, animation_view);
+    bubble_animation_view_free(animation_manager->animation_view);
+    furi_timer_free(animation_manager->idle_animation_timer);
+}
+
+View* animation_manager_get_animation_view(AnimationManager* animation_manager) {
+    furi_assert(animation_manager);
+
+    return view_stack_get_view(animation_manager->view_stack);
+}
+
+static bool animation_manager_is_valid_idle_animation_relaxed(
+    const StorageAnimationManifestInfo* info,
+    const DolphinStats* stats,
+    bool ignore_level) {
+    furi_assert(info);
+    furi_assert(info->name);
+
+    bool result = true;
+
+    if(!strcmp(info->name, BAD_BATTERY_ANIMATION_NAME)) {
+        Power* power = furi_record_open(RECORD_POWER);
+        bool battery_is_well = power_is_battery_healthy(power);
+        furi_record_close(RECORD_POWER);
+
+        result = !battery_is_well;
+    }
+    if(!strcmp(info->name, NO_SD_ANIMATION_NAME)) {
+        /* Never show the "missing SD card" screen on the idle desktop. When no
+         * SD card is present we fall through to the default Netrunner animation
+         * instead. SD-required warnings still appear contextually when an app
+         * that needs the card is opened (see loader.c and the per-app error
+         * scenes). */
+        result = false;
+    }
+    if(!netrunner_settings.unlock_anims) {
+        if((stats->butthurt < info->min_butthurt) || (stats->butthurt > info->max_butthurt)) {
+            result = false;
+        }
+        if(!ignore_level &&
+           ((stats->level < info->min_level) || (stats->level > info->max_level))) {
+            result = false;
+        }
+    }
+
+    return result;
+}
+
+static bool animation_manager_is_valid_idle_animation(
+    const StorageAnimationManifestInfo* info,
+    const DolphinStats* stats) {
+    return animation_manager_is_valid_idle_animation_relaxed(info, stats, false);
+}
+
+static StorageAnimation*
+    animation_manager_select_idle_animation(AnimationManager* animation_manager) {
+    if(animation_manager->dummy_mode) {
+        return animation_storage_find_animation(HARDCODED_ANIMATION_NAME);
+    }
+
+    /* A chosen wallpaper pins the idle screen while Unlock Anims is off: the
+     * desktop shows exactly that animation instead of cycling. With Unlock
+     * Anims on, the choice is ignored and selection cycles normally. Falls
+     * through to weighted selection if nothing is pinned or the name is no
+     * longer in the pack, so a stale choice can never blank the screen. */
+    if(!netrunner_settings.unlock_anims && netrunner_settings.wallpaper[0]) {
+        StorageAnimation* pinned = animation_storage_find_animation(netrunner_settings.wallpaper);
+        if(pinned) {
+            return pinned;
+        }
+    }
+
+    const char* avoid_animation = NULL;
+    if(animation_manager->current_animation) {
+        avoid_animation = animation_storage_get_meta(animation_manager->current_animation)->name;
+    }
+
+    StorageAnimationList_t animation_list;
+    StorageAnimationList_init(animation_list);
+    animation_storage_fill_animation_list(&animation_list);
+
+    Dolphin* dolphin = furi_record_open(RECORD_DOLPHIN);
+    DolphinStats stats = dolphin_stats(dolphin);
+    furi_record_close(RECORD_DOLPHIN);
+
+    StorageAnimationList_it_t it;
+    for(StorageAnimationList_it(it, animation_list); !StorageAnimationList_end_p(it);) {
+        StorageAnimation* storage_animation = *StorageAnimationList_ref(it);
+        const StorageAnimationManifestInfo* manifest_info =
+            animation_storage_get_meta(storage_animation);
+        bool valid = animation_manager_is_valid_idle_animation(manifest_info, &stats);
+        if(!strcmp(manifest_info->name, HARDCODED_ANIMATION_NAME)) {
+            /* The compiled fallback is selected only after normal selection fails. */
+            valid = false;
+        }
+
+        if(valid) {
+            StorageAnimationList_next(it);
+        } else {
+            animation_storage_free_storage_animation(&storage_animation);
+            /* remove and increase iterator */
+            StorageAnimationList_remove(animation_list, it);
+        }
+    }
+
+    /* Restoring a backup also restores Dolphin level and mood. Some legitimate
+     * combinations (notably a low-level, very sad/angry Dolphin) leave only one
+     * manifest entry eligible, so the Meta.txt timer fires but can only select
+     * that same animation forever. If strict progression filtering cannot
+     * provide a choice, retain the mood range and relax only the level gate.
+     * This keeps the restored emotion visible while allowing animations to
+     * cycle again. */
+    const size_t strict_count = StorageAnimationList_size(animation_list);
+    if((strict_count < 2U) && !netrunner_settings.unlock_anims) {
+        for
+            M_EACH(item, animation_list, StorageAnimationList_t) {
+                animation_storage_free_storage_animation(item);
+            }
+        StorageAnimationList_clear(animation_list);
+        animation_storage_fill_animation_list(&animation_list);
+
+        for(StorageAnimationList_it(it, animation_list); !StorageAnimationList_end_p(it);) {
+            StorageAnimation* storage_animation = *StorageAnimationList_ref(it);
+            const StorageAnimationManifestInfo* manifest_info =
+                animation_storage_get_meta(storage_animation);
+            bool valid =
+                animation_manager_is_valid_idle_animation_relaxed(manifest_info, &stats, true);
+            if(!strcmp(manifest_info->name, HARDCODED_ANIMATION_NAME)) valid = false;
+
+            if(valid) {
+                StorageAnimationList_next(it);
+            } else {
+                animation_storage_free_storage_animation(&storage_animation);
+                StorageAnimationList_remove(animation_list, it);
+            }
+        }
+
+        if(StorageAnimationList_size(animation_list) > strict_count) {
+            FURI_LOG_I(
+                TAG,
+                "Only %u strict animation(s); relaxed level gate for mood %u",
+                (unsigned)strict_count,
+                (unsigned)stats.butthurt);
+        }
+    }
+
+    if(StorageAnimationList_size(animation_list) == 1) {
+        /* A single valid animation must remain selectable even if it is current. */
+        avoid_animation = NULL;
+    }
+
+    uint64_t whole_weight = 0;
+    for(StorageAnimationList_it(it, animation_list); !StorageAnimationList_end_p(it);) {
+        StorageAnimation* storage_animation = *StorageAnimationList_ref(it);
+        const StorageAnimationManifestInfo* manifest_info =
+            animation_storage_get_meta(storage_animation);
+
+        if(avoid_animation && !strcmp(manifest_info->name, avoid_animation)) {
+            animation_storage_free_storage_animation(&storage_animation);
+            StorageAnimationList_remove(animation_list, it);
+        } else {
+            whole_weight += manifest_info->weight;
+            StorageAnimationList_next(it);
+        }
+    }
+
+    StorageAnimation* selected = NULL;
+    if(whole_weight > 0) {
+        const uint64_t random_value =
+            ((uint64_t)furi_hal_random_get() << 32) | furi_hal_random_get();
+        const uint64_t lucky_number = random_value % whole_weight;
+        uint64_t weight = 0;
+
+        for
+            M_EACH(item, animation_list, StorageAnimationList_t) {
+                weight += animation_storage_get_meta(*item)->weight;
+                if(lucky_number < weight) {
+                    selected = *item;
+                    break;
+                }
+            }
+    }
+
+    for
+        M_EACH(item, animation_list, StorageAnimationList_t) {
+            if(*item != selected) {
+                animation_storage_free_storage_animation(item);
+            }
+        }
+
+    StorageAnimationList_clear(animation_list);
+
+    /* cache animation, if failed - choose reliable animation */
+    if(!selected) {
+        FURI_LOG_E(TAG, "No selectable animation, using compiled fallback");
+        selected = animation_storage_find_animation(HARDCODED_ANIMATION_NAME);
+    } else if(!animation_storage_get_bubble_animation(selected)) {
+        const char* name = animation_storage_get_meta(selected)->name;
+        FURI_LOG_E(TAG, "Can't upload animation described in manifest: \'%s\'", name);
+        animation_storage_free_storage_animation(&selected);
+        selected = animation_storage_find_animation(HARDCODED_ANIMATION_NAME);
+    }
+
+    furi_assert(selected);
+    return selected;
+}
+
+bool animation_manager_is_animation_loaded(AnimationManager* animation_manager) {
+    furi_assert(animation_manager);
+    return animation_manager->current_animation;
+}
+
+void animation_manager_unload_and_stall_animation(AnimationManager* animation_manager) {
+    furi_assert(animation_manager);
+    furi_assert(animation_manager->current_animation);
+    furi_assert(!furi_string_size(animation_manager->freezed_animation_name));
+    furi_assert(
+        (animation_manager->state == AnimationManagerStateIdle) ||
+        (animation_manager->state == AnimationManagerStateBlocked));
+
+    animation_manager->freezed_settings_revision = netrunner_settings_revision;
+
+    if(animation_manager->state == AnimationManagerStateBlocked) {
+        animation_manager->state = AnimationManagerStateFreezedBlocked;
+    } else if(animation_manager->state == AnimationManagerStateIdle) { //-V547
+        animation_manager->state = AnimationManagerStateFreezedIdle;
+
+        animation_manager->freezed_animation_time_left = 0;
+        if(furi_timer_is_running(animation_manager->idle_animation_timer)) {
+            const int32_t time_left =
+                (int32_t)(furi_timer_get_expire_time(animation_manager->idle_animation_timer) -
+                          furi_get_tick());
+            if(time_left > 0) {
+                animation_manager->freezed_animation_time_left = time_left;
+            }
+        }
+        furi_timer_stop(animation_manager->idle_animation_timer);
+    } else {
+        furi_crash();
+    }
+
+    FURI_LOG_I(
+        TAG,
+        "Unload animation \'%s\'",
+        animation_storage_get_meta(animation_manager->current_animation)->name);
+
+    StorageAnimationManifestInfo* meta =
+        animation_storage_get_meta(animation_manager->current_animation);
+    /* copy str, not move, because it can be internal animation */
+    furi_string_set(animation_manager->freezed_animation_name, meta->name);
+
+    bubble_animation_freeze(animation_manager->animation_view);
+    animation_storage_free_storage_animation(&animation_manager->current_animation);
+}
+
+void animation_manager_load_and_continue_animation(AnimationManager* animation_manager) {
+    furi_assert(animation_manager);
+    furi_assert(!animation_manager->current_animation);
+    furi_assert(furi_string_size(animation_manager->freezed_animation_name));
+    furi_assert(
+        (animation_manager->state == AnimationManagerStateFreezedIdle) ||
+        (animation_manager->state == AnimationManagerStateFreezedBlocked));
+
+    if(animation_manager->state == AnimationManagerStateFreezedBlocked) {
+        StorageAnimation* restore_animation = animation_storage_find_animation(
+            furi_string_get_cstr(animation_manager->freezed_animation_name));
+        /* all blocked animations must be in netrunner -> we can
+         * always find blocking animation */
+        furi_assert(restore_animation);
+        animation_manager_replace_current_animation(animation_manager, restore_animation);
+        animation_manager->state = AnimationManagerStateBlocked;
+    } else if(animation_manager->state == AnimationManagerStateFreezedIdle) { //-V547
+        /* check if we missed some system notifications, and set current_animation */
+        bool blocked = animation_manager_check_blocking(animation_manager);
+        bool settings_changed =
+            animation_manager->freezed_settings_revision != netrunner_settings_revision;
+        if(!blocked && !settings_changed) {
+            /* if no blocking - try restore last one idle */
+            StorageAnimation* restore_animation = animation_storage_find_animation(
+                furi_string_get_cstr(animation_manager->freezed_animation_name));
+            if(restore_animation) {
+                Dolphin* dolphin = furi_record_open(RECORD_DOLPHIN);
+                DolphinStats stats = dolphin_stats(dolphin);
+                furi_record_close(RECORD_DOLPHIN);
+                const StorageAnimationManifestInfo* manifest_info =
+                    animation_storage_get_meta(restore_animation);
+                bool valid = animation_manager_is_valid_idle_animation(manifest_info, &stats);
+                if(valid && strcmp(manifest_info->name, HARDCODED_ANIMATION_NAME)) {
+                    animation_manager_replace_current_animation(
+                        animation_manager, restore_animation);
+                    animation_manager->state = AnimationManagerStateIdle;
+
+                    const BubbleAnimation* animation = animation_storage_get_bubble_animation(
+                        animation_manager->current_animation);
+                    animation_manager_arm_idle_timer(
+                        animation_manager,
+                        animation,
+                        animation_manager->freezed_animation_time_left > 0 ?
+                            (uint32_t)animation_manager->freezed_animation_time_left :
+                            0);
+                } else {
+                    animation_storage_free_storage_animation(&restore_animation);
+                }
+            } else {
+                FURI_LOG_E(
+                    TAG,
+                    "Failed to restore \'%s\'",
+                    furi_string_get_cstr(animation_manager->freezed_animation_name));
+            }
+        } else if(!blocked && settings_changed) {
+            FURI_LOG_I(TAG, "Netrunner animation settings changed; selecting a fresh idle");
+        }
+    } else {
+        /* Unknown state is an error. But not in release version.*/
+        furi_crash();
+    }
+
+    /* if can't restore previous animation - select new */
+    if(!animation_manager->current_animation) {
+        animation_manager_start_new_idle(animation_manager);
+    }
+    FURI_LOG_I(
+        TAG,
+        "Load animation \'%s\'",
+        animation_storage_get_meta(animation_manager->current_animation)->name);
+
+    bubble_animation_unfreeze(animation_manager->animation_view);
+    furi_string_reset(animation_manager->freezed_animation_name);
+    furi_assert(animation_manager->current_animation);
+}
+
+static void animation_manager_switch_to_one_shot_view(AnimationManager* animation_manager) {
+    furi_assert(animation_manager);
+    furi_assert(!animation_manager->one_shot_view);
+    Dolphin* dolphin = furi_record_open(RECORD_DOLPHIN);
+    DolphinStats stats = dolphin_stats(dolphin);
+    furi_record_close(RECORD_DOLPHIN);
+
+    animation_manager->one_shot_view = one_shot_view_alloc();
+    one_shot_view_set_interact_callback(
+        animation_manager->one_shot_view, animation_manager_interact_callback, animation_manager);
+    View* prev_view = bubble_animation_get_view(animation_manager->animation_view);
+    View* next_view = one_shot_view_get_view(animation_manager->one_shot_view);
+    view_stack_remove_view(animation_manager->view_stack, prev_view);
+    view_stack_add_view(animation_manager->view_stack, next_view);
+    /* One level-agnostic animation, as Netrunner does. The old pair literally drew
+    * "2" and "3" and anything past level 2 hit furi_crash() -- survivable only
+    * while three levels was the ceiling. */
+    one_shot_view_start_animation(animation_manager->one_shot_view, &A_Levelup_128x64);
+}
+
+static void animation_manager_switch_to_animation_view(AnimationManager* animation_manager) {
+    furi_assert(animation_manager);
+    furi_assert(animation_manager->one_shot_view);
+
+    View* prev_view = one_shot_view_get_view(animation_manager->one_shot_view);
+    View* next_view = bubble_animation_get_view(animation_manager->animation_view);
+    view_stack_remove_view(animation_manager->view_stack, prev_view);
+    view_stack_add_view(animation_manager->view_stack, next_view);
+    one_shot_view_free(animation_manager->one_shot_view);
+    animation_manager->one_shot_view = NULL;
+}

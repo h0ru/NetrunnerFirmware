@@ -1,0 +1,199 @@
+/**
+ * @file notification_app.h
+ * @brief ESP32 notification app internals — exposes NotificationSettings and
+ *        NotificationApp so that the settings UI can read/write them directly.
+ *
+ * Kept as close to the STM32 unleashed-firmware version as possible;
+ * STM32-only fields (RGB backlight, contrast, lcd_inversion, led_brightness)
+ * are omitted because the ESP32 boards lack that hardware.
+ */
+#pragma once
+
+#include <furi.h>
+#include <furi_hal_display.h> /* FURI_HAL_DISPLAY_GRADIENT_MAX_STOPS */
+#include "notification.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum {
+    LayerInternal = 0,
+    LayerNotification = 1,
+    LayerMAX = 2,
+} NotificationLedLayerIndex;
+
+/* WS2812 ring effect modes (T-Embed Plus). Solid is the static settings.led_color.
+ * Off is unconditional dark. The rest are animated and run on a periodic timer
+ * whose interval comes from settings.led_speed_tick_ms.
+ * Storage uses uint8_t for forward compat. */
+typedef enum {
+    LedEffectSolid     = 0,
+    LedEffectOff       = 1,
+    LedEffectBreathing = 2,  /* smooth pulse, ~2s/breath */
+    LedEffectChase     = 3,  /* one bright pixel walking around with dim trail */
+    LedEffectRainbow   = 4,  /* hue spatial spin around ring */
+    LedEffectStrobe    = 5,  /* sharp on/off flashes */
+    LedEffectCylon     = 6,  /* back-and-forth sweep with adjacent fade */
+    LedEffectSparkle   = 7,  /* random pixels twinkle on dark base */
+    LedEffectWipe      = 8,  /* color paints across the ring then clears */
+    LedEffectCount     = 9,
+} LedEffect;
+
+typedef struct {
+    uint8_t value[LayerMAX];
+    NotificationLedLayerIndex index;
+} NotificationDisplayLayer;
+
+/* UI Background palette sentinel: an ui_color_index value meaning "use the
+ * user-defined ui_custom_color" (chosen via the color picker). Sits one past
+ * the Spectrum sentinel (UI_COLOR_SPECTRUM_INDEX = 10, defined in notification.c). */
+#define UI_COLOR_CUSTOM_INDEX 11
+/* Color the picker opens with before any custom color has been defined. */
+#define UI_CUSTOM_DEFAULT_RGB 0xFF1F3Du /* Netrunner red, same as the "Red" preset */
+
+typedef struct {
+    float display_brightness;
+    uint32_t display_off_delay_ms;
+    /* Idle time before DEEP SLEEP, measured from the same activity as the
+     * dim above (not from the dim itself). 0 = never sleep. Always clamped
+     * to be later than the dim, since sleeping first would make the dim
+     * setting unobservable. */
+    uint32_t display_sleep_delay_ms;
+    float speaker_volume;
+    bool vibro_on;
+    float night_shift;
+    uint32_t night_shift_start;
+    uint32_t night_shift_end;
+    /* WS2812 RGB ring color (T-Embed Plus). Packed as 0x00RRGGBB at full
+     * saturation per active channel. 0 = off. The actual hardware output is
+     * (channel * led_brightness). */
+    uint32_t led_color;
+    /* WS2812 brightness multiplier (0.0 - 1.0). Multiplied into each
+     * channel of led_color before the WS2812 push. Default 0.5 keeps the
+     * 8-LED ring within ~240 mA peak draw — safe on hub-powered USB. */
+    float led_brightness;
+    /* Auto-off timeout for the WS2812 ring, in milliseconds.
+     * 0 = always on. The ring re-lights with the last color on the next
+     * input event. Mirrors display_off_delay_ms. */
+    uint32_t led_off_delay_ms;
+    /* LED animation effect (LedEffect enum stored as uint8_t). */
+    uint8_t led_effect;
+    /* Animation tick interval in milliseconds. Smaller = faster effects.
+     * Default 33ms (~30fps). User picks from a fixed set in the settings UI. */
+    uint32_t led_speed_tick_ms;
+    /* UI Background tint (fg_color in the HAL — fills "unset" mono pixels =
+     * the field around drawn UI elements). Index into ui_color_value[] in
+     * notification.c. UI_COLOR_SPECTRUM_INDEX triggers a periodic HSV cycle.
+     * Default = Red (index 2, the Netrunner accent). */
+    uint8_t ui_color_index;
+    /* UI Foreground tint (bg_color in the HAL — fills "set" mono pixels =
+     * the drawn UI elements: text, icons, borders). Same palette as
+     * ui_color_index. Default = Black (preserves stock contrast). */
+    uint8_t ui_fg_color_index;
+    /* User-defined custom UI Background color, packed 0x00RRGGBB. Applied when
+     * ui_color_index == UI_COLOR_CUSTOM_INDEX. Picked via the color picker in
+     * the Sound & Display settings ("UI Background" → "Custom"). */
+    uint32_t ui_custom_color;
+    /* True once the user has defined a custom background color at least once.
+     * Controls whether the "#RRGGBB" entry is offered in the UI Background
+     * value cycle (it persists as a selectable preset until replaced). */
+    bool ui_custom_color_set;
+
+    /* --- UI Background gradient (Sound & Display -> Colors) ---
+     * Number of gradient stops. 1 = flat UI Background, i.e. gradient off;
+     * 2..FURI_HAL_DISPLAY_GRADIENT_MAX_STOPS blends between the stops below.
+     * The settings list shows exactly this many "Color n" rows. */
+    uint8_t ui_bg_color_count;
+    /* How the stops are mixed down the panel: a FuriHalDisplayGradientMode. */
+    uint8_t ui_bg_mix;
+    /* Per-stop palette index, same encoding as ui_color_index above:
+     * UI_COLOR_CUSTOM_INDEX takes its color from ui_bg_stop_custom[] instead. */
+    uint8_t ui_bg_stop_index[FURI_HAL_DISPLAY_GRADIENT_MAX_STOPS];
+    /* Ramp direction: false = down the screen, true = across it. */
+    bool ui_bg_horizontal;
+    /* Per-stop custom color, packed 0x00RRGGBB. */
+    uint32_t ui_bg_stop_custom[FURI_HAL_DISPLAY_GRADIENT_MAX_STOPS];
+} NotificationSettings;
+
+struct NotificationApp {
+    FuriMessageQueue* queue;
+    FuriPubSub* event_record;
+    FuriTimer* display_timer;
+    /* Second idle stage: the display dims first, then this fires and the
+     * device enters deep sleep. */
+    FuriTimer* display_sleep_timer;
+    FuriTimer* night_shift_timer;
+    FuriTimer* night_shift_demo_timer;
+    FuriTimer* led_off_timer;
+    FuriTimer* led_effect_timer;
+    FuriTimer* ui_spectrum_timer;
+
+    NotificationDisplayLayer display;
+    /* Reference-counted because Wake mode and a running app may both require
+     * the display to stay awake at the same time. */
+    uint8_t display_led_lock_count;
+    /* True while the WS2812 ring is darkened by the idle-off timer. Lets the
+     * input callback decide between a full re-light (reset phase + restart
+     * effect) and a cheap idle-timer re-arm that leaves a running animation
+     * untouched. */
+    bool led_idle_off;
+    /* True while the backlight is held at the dim idle level. */
+    bool display_idle_dim;
+
+    /* Temporary ambient-effect override, set by apps (e.g. NFC per-mode LED
+     * effects) via NotificationMessageTypeLedEffectOverride. While active it
+     * supersedes settings.led_effect / led_speed_tick_ms / led_color on the
+     * WS2812 ring without persisting; cleared by the matching Reset message. */
+    bool led_effect_override_active;
+    uint8_t led_effect_override;        /* LedEffect */
+    uint32_t led_effect_override_speed; /* tick ms; 0 = use settings speed */
+    bool led_effect_override_has_color;
+    uint32_t led_effect_override_color; /* 0x00RRGGBB */
+
+    /* Master switch for app-driven LED effect overrides (NotificationMessageType
+     * LedEffectOverride). When false, those messages are ignored and the ring
+     * stays on the user's ambient effect. Persisted separately from settings
+     * (its own small saved_struct file) so it needs no settings version bump. */
+    bool led_app_effects;
+
+    /* Panel red/blue (MADCTL colour) order. LilyGo T-Embed panels differ by
+     * batch, so this is per-unit: true = BGR (board boot default), false = RGB.
+     * Persisted separately from settings (its own small saved_struct file) so it
+     * needs no settings version bump, same as led_app_effects above. */
+    bool lcd_bgr_order;
+
+    NotificationSettings settings;
+    float current_night_shift;
+};
+
+/** Save current settings (enqueues a save message to the notification thread). */
+void notification_message_save_settings(NotificationApp* app);
+
+/** Push settings.led_color to the WS2812 ring. Call after settings.led_color
+ * changes so the LEDs reflect it without requiring a reboot. */
+void notification_apply_led_color(NotificationApp* app);
+
+/** Enable/disable app-driven LED effect overrides, and persist the choice. */
+void notification_led_app_effects_set(NotificationApp* app, bool enabled);
+
+/** Set the panel red/blue (MADCTL colour) order, apply it to the LCD now, and
+ * persist the choice per-unit. bgr=true = BGR, false = RGB. */
+void notification_set_color_order(NotificationApp* app, bool bgr);
+
+/** Push settings.ui_color_index to the LCD foreground tint. For the Spectrum
+ * index, starts/stops a periodic timer that cycles the hue. */
+void notification_apply_ui_color(NotificationApp* app);
+
+/** Rebuild the UI Background gradient from settings (or disable it when the
+ * stop count is 1). Called by notification_apply_ui_color(), so callers that
+ * already invoke that do not need this directly. */
+void notification_apply_ui_gradient(NotificationApp* app);
+
+/** Night-shift timer control (used by settings app). */
+void night_shift_timer_start(NotificationApp* app);
+void night_shift_timer_stop(NotificationApp* app);
+
+#ifdef __cplusplus
+}
+#endif

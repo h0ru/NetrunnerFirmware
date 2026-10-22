@@ -1,0 +1,54 @@
+idf_component_register(
+    SRCS
+        "gui.c"
+        "canvas.c"
+        "icon.c"
+        "icon_animation.c"
+        "elements.c"
+        "view.c"
+        "view_port.c"
+        "view_holder.c"
+        "view_dispatcher.c"
+        "view_stack.c"
+        "scene_manager.c"
+        "modules/button_menu.c"
+        "modules/button_panel.c"
+        "modules/byte_input.c"
+        "modules/date_time_input.c"
+        "modules/dialog_ex.c"
+        "modules/empty_screen.c"
+        "modules/file_browser.c"
+        "modules/file_browser_worker.c"
+        "modules/loading.c"
+        "modules/menu.c"
+        "modules/number_input.c"
+        "modules/popup.c"
+        "modules/submenu.c"
+        "modules/text_box.c"
+        "modules/text_input.c"
+        "modules/validators.c"
+        "modules/variable_item_list.c"
+        "modules/widget.c"
+        "modules/widget_elements/widget_element_button.c"
+        "modules/widget_elements/widget_element_circle.c"
+        "modules/widget_elements/widget_element_icon.c"
+        "modules/widget_elements/widget_element_icon_animation.c"
+        "modules/widget_elements/widget_element_line.c"
+        "modules/widget_elements/widget_element_rect.c"
+        "modules/widget_elements/widget_element_string.c"
+        "modules/widget_elements/widget_element_string_multiline.c"
+        "modules/widget_elements/widget_element_text_box.c"
+        "modules/widget_elements/widget_element_text_scroll.c"
+        # Asset packs replace icons and fonts, so they need gui's own headers.
+        # Built here rather than in the netrunner component because gui already
+        # requires netrunner, and the reverse dependency would be a cycle.
+        "../../lib/netrunner/asset_packs.c"
+    INCLUDE_DIRS "." "modules" "modules/widget_elements"
+    # ".." puts components/ on the path so the menu's PS4 style can reach
+    # <dolphin/dolphin.h>, which is a shim forwarding into applications/.
+    PRIV_INCLUDE_DIRS ".."
+    REQUIRES furi furi_hal u8g2 toolbox input notification assets mlib datetime storage netrunner
+             locale
+)
+
+target_compile_definitions(${COMPONENT_LIB} PRIVATE ESP32_HAS_STORAGE=1)

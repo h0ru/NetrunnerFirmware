@@ -1,0 +1,766 @@
+#include "loader.h"
+#include <netrunner/settings.h>
+#include "loader_i.h"
+#include <applications.h>
+#include <furi_hal.h>
+#include <dolphin/dolphin.h>
+#include <netrunner_application/netrunner_application.h>
+#include <netrunner_application/api_hashtable/api_hashtable.h>
+#include <storage/storage.h>
+#include <toolbox/path.h>
+#include <dialogs/dialogs.h>
+#include <gui/modules/loading.h>
+#include <icon_i.h>
+
+/* A launched FAP's 10x10 manifest icon, wrapped as an Icon so the loading
+ * screen and in-app loading indicators can show it. The frame points into the
+ * FAP's manifest, so it is valid only while loader->app.fap is. */
+static const uint8_t* loader_fap_icon_frames[1];
+static const Icon loader_fap_icon = {
+    .width = 10,
+    .height = 10,
+    .frame_count = 1,
+    .frame_rate = 1,
+    .frames = loader_fap_icon_frames,
+};
+
+extern const ElfApiInterface* const firmware_api_interface;
+
+#define TAG "Loader"
+
+#define LOADER_MAGIC_THREAD_VALUE 0xDEADBEEF
+
+// API
+
+static LoaderMessageLoaderStatusResult loader_start_internal(
+    Loader* loader,
+    const char* name,
+    const char* args,
+    FuriString* error_message) {
+    LoaderMessage message;
+    LoaderMessageLoaderStatusResult result;
+
+    message.type = LoaderMessageTypeStartByName;
+    message.start.name = name;
+    message.start.args = args;
+    message.start.error_message = error_message;
+    message.api_lock = api_lock_alloc_locked();
+    message.status_value = &result;
+    furi_message_queue_put(loader->queue, &message, FuriWaitForever);
+    api_lock_wait_unlock_and_free(message.api_lock);
+
+    return result;
+}
+
+LoaderStatus loader_start(
+    Loader* loader,
+    const char* name,
+    const char* args,
+    FuriString* error_message) {
+    furi_check(loader);
+    furi_check(name);
+
+    LoaderMessageLoaderStatusResult result =
+        loader_start_internal(loader, name, args, error_message);
+    return result.value;
+}
+
+static void loader_show_gui_error(const FuriString* error_message) {
+    const char* detail = furi_string_get_cstr(error_message);
+    const char* missing = strstr(detail, "Unsupported ARM import: ");
+    FuriString* text = furi_string_alloc();
+    if(missing) {
+        missing += strlen("Unsupported ARM import: ");
+        furi_string_printf(text, "ARM API missing:\n%.48s", missing);
+    } else {
+        /* Keep the reason; the log retains the full path and diagnostic. */
+        const char* reason = strrchr(detail, ':');
+        furi_string_set(text, reason ? reason + 1 : detail);
+        if(furi_string_empty(text)) furi_string_set(text, "Unable to load app");
+    }
+
+    DialogsApp* dialogs = furi_record_open(RECORD_DIALOGS);
+    DialogMessage* message = dialog_message_alloc();
+    dialog_message_set_header(
+        message, missing ? "Unsupported app" : "App load failed", 64, 2, AlignCenter, AlignTop);
+    dialog_message_set_text(message, furi_string_get_cstr(text), 2, 17, AlignLeft, AlignTop);
+    /* T-Embed has OK and Back, but no Left/Right buttons. */
+    dialog_message_set_buttons(message, NULL, "OK", NULL);
+    dialog_message_show(dialogs, message);
+    dialog_message_free(message);
+    furi_record_close(RECORD_DIALOGS);
+    furi_string_free(text);
+}
+
+LoaderStatus
+    loader_start_with_gui_error(Loader* loader, const char* name, const char* args) {
+    furi_check(loader);
+    furi_check(name);
+
+    FuriString* error_message = furi_string_alloc();
+    LoaderMessageLoaderStatusResult result =
+        loader_start_internal(loader, name, args, error_message);
+    if(result.value != LoaderStatusOk) {
+        FURI_LOG_E(TAG, "Start error: %s", furi_string_get_cstr(error_message));
+        loader_show_gui_error(error_message);
+    }
+    furi_string_free(error_message);
+    return result.value;
+}
+
+void loader_start_detached_with_gui_error(
+    Loader* loader,
+    const char* name,
+    const char* args) {
+    furi_check(loader);
+    furi_check(name);
+
+    LoaderMessage message = {
+        .type = LoaderMessageTypeStartByNameDetachedWithGuiError,
+        .start.name = strdup(name),
+        .start.args = args ? strdup(args) : NULL,
+    };
+    furi_message_queue_put(loader->queue, &message, FuriWaitForever);
+}
+
+static void
+    loader_generic_synchronous_request(Loader* loader, LoaderMessage* message) {
+    furi_check(loader);
+    message->api_lock = api_lock_alloc_locked();
+    furi_message_queue_put(loader->queue, message, FuriWaitForever);
+    api_lock_wait_unlock_and_free(message->api_lock);
+}
+
+bool loader_lock(Loader* loader) {
+    LoaderMessageBoolResult result;
+    LoaderMessage message = {
+        .type = LoaderMessageTypeLock,
+        .bool_value = &result,
+    };
+    loader_generic_synchronous_request(loader, &message);
+    return result.value;
+}
+
+void loader_unlock(Loader* loader) {
+    furi_check(loader);
+
+    LoaderMessage message;
+    message.type = LoaderMessageTypeUnlock;
+
+    furi_message_queue_put(loader->queue, &message, FuriWaitForever);
+}
+
+bool loader_is_locked(Loader* loader) {
+    LoaderMessageBoolResult result;
+    LoaderMessage message = {
+        .type = LoaderMessageTypeIsLocked,
+        .bool_value = &result,
+    };
+    loader_generic_synchronous_request(loader, &message);
+    return result.value;
+}
+
+void loader_show_menu(Loader* loader) {
+    furi_check(loader);
+
+    LoaderMessage message;
+    message.type = LoaderMessageTypeShowMenu;
+
+    furi_message_queue_put(loader->queue, &message, FuriWaitForever);
+}
+
+void loader_show_settings(Loader* loader) {
+    furi_check(loader);
+
+    LoaderMessage message;
+    message.type = LoaderMessageTypeShowSettings;
+
+    furi_message_queue_put(loader->queue, &message, FuriWaitForever);
+}
+
+FuriPubSub* loader_get_pubsub(Loader* loader) {
+    furi_check(loader);
+    return loader->pubsub;
+}
+
+void loader_enqueue_launch(
+    Loader* instance,
+    const char* name,
+    const char* args,
+    LoaderDeferredLaunchFlag flags) {
+    furi_check(instance);
+    furi_check(name);
+    LoaderMessage message = {
+        .type = LoaderMessageTypeEnqueueLaunch,
+        .defer_start = {
+            .name_or_path = strdup(name),
+            .args = args ? strdup(args) : NULL,
+            .flags = flags,
+        },
+    };
+    loader_generic_synchronous_request(instance, &message);
+}
+
+bool loader_get_application_launch_path(Loader* instance, FuriString* path) {
+    UNUSED(instance);
+    UNUSED(path);
+    /* ESP32 port: no FAP paths */
+    return false;
+}
+
+// callbacks
+
+static void loader_menu_closed_callback(void* context) {
+    Loader* loader = context;
+    LoaderMessage message;
+    message.type = LoaderMessageTypeMenuClosed;
+    furi_message_queue_put(loader->queue, &message, FuriWaitForever);
+}
+
+static void loader_applications_closed_callback(void* context) {
+    Loader* loader = context;
+    LoaderMessage message;
+    message.type = LoaderMessageTypeApplicationsClosed;
+    furi_message_queue_put(loader->queue, &message, FuriWaitForever);
+}
+
+static void loader_thread_state_callback(
+    FuriThread* thread,
+    FuriThreadState thread_state,
+    void* context) {
+    UNUSED(thread);
+    furi_assert(context);
+
+    if(thread_state == FuriThreadStateStopped) {
+        Loader* loader = context;
+        LoaderMessage message;
+        message.type = LoaderMessageTypeAppClosed;
+        furi_message_queue_put(loader->queue, &message, FuriWaitForever);
+    }
+}
+
+// implementation
+
+static Loader* loader_alloc(void) {
+    Loader* loader = malloc(sizeof(Loader));
+    memset(loader, 0, sizeof(Loader));
+    loader->pubsub = furi_pubsub_alloc();
+    loader->queue = furi_message_queue_alloc(1, sizeof(LoaderMessage));
+    loader->gui = furi_record_open(RECORD_GUI);
+    loader->view_holder = view_holder_alloc();
+    loader->loading = loading_alloc();
+    view_holder_attach_to_gui(loader->view_holder, loader->gui);
+    return loader;
+}
+
+static const NetrunnerInternalApplication*
+    loader_find_application_by_name(const char* name) {
+    const struct {
+        const NetrunnerInternalApplication* list;
+        const size_t count;
+    } lists[] = {
+        {NETRUNNER_APPS, NETRUNNER_APPS_COUNT},
+        {NETRUNNER_SETTINGS_APPS, NETRUNNER_SETTINGS_APPS_COUNT},
+        {NETRUNNER_SYSTEM_APPS, NETRUNNER_SYSTEM_APPS_COUNT},
+        {NETRUNNER_DEBUG_APPS, NETRUNNER_DEBUG_APPS_COUNT},
+    };
+
+    for(size_t i = 0; i < COUNT_OF(lists); i++) {
+        for(size_t j = 0; j < lists[i].count; j++) {
+            if((strcmp(name, lists[i].list[j].name) == 0) ||
+               (strcmp(name, lists[i].list[j].appid) == 0)) {
+                return &lists[i].list[j];
+            }
+        }
+    }
+
+    // Check NETRUNNER_ARCHIVE separately (not always in SYSTEM_APPS array)
+    if((strcmp(name, NETRUNNER_ARCHIVE.name) == 0) ||
+       (strcmp(name, NETRUNNER_ARCHIVE.appid) == 0)) {
+        return &NETRUNNER_ARCHIVE;
+    }
+
+    return NULL;
+}
+
+static void loader_start_internal_app(
+    Loader* loader,
+    const NetrunnerInternalApplication* app,
+    const char* args) {
+    FURI_LOG_I(TAG, "Starting %s", app->name);
+
+    /* XP for opening an internal app, mirroring what loader_applications.c
+     * already does for external FAPs.
+     *
+     * Before this, only in-app ACTIONS scored -- reading a card, sending a
+     * signal, saving a file -- so the apps with no such action (WiFi, NRF24,
+     * BLE Spam, ESP-NOW, Power Profiler, Clock, the games, the settings
+     * screens) could never contribute anything at all.
+     *
+     * External FAPs take loader_start_external_fap() instead and are awarded
+     * there, so nothing is counted twice. The DolphinAppPlugin category is
+     * capped at 69 points a day, which is what stops open-close-repeat from
+     * being a farm. */
+    dolphin_deed(DolphinDeedPluginInternalStart);
+
+    /* Remembered so deep sleep can come back to this app. app->name is what
+     * loader_find_application_by_name() matches, so it launches again as-is. */
+    furi_hal_rtc_set_resume_app(app->name);
+
+    furi_assert(loader->app.args == NULL);
+    if(args && strlen(args) > 0) {
+        loader->app.args = strdup(args);
+    }
+
+    loader->app.thread = furi_thread_alloc_ex_foreground(
+        app->name, app->stack_size, app->app, loader->app.args);
+
+    furi_thread_set_appid(loader->app.thread, app->appid);
+    /* Loading screens inside the app show its menu icon (Sub-GHz, NFC, ...). */
+    loading_set_app_icon(app->icon);
+    furi_thread_set_state_context(loader->app.thread, loader);
+    furi_thread_set_state_callback(loader->app.thread, loader_thread_state_callback);
+
+    furi_thread_start(loader->app.thread);
+}
+
+static bool loader_is_external_fap_path(const char* name) {
+    furi_check(name);
+
+    const char* extension = strrchr(name, '.');
+    return extension && (strcmp(extension, ".fap") == 0);
+}
+
+static LoaderStatus loader_start_external_fap(
+    Loader* loader,
+    const char* path,
+    const char* args,
+    FuriString* error_message) {
+    LoaderStatus status = LoaderStatusErrorInternal;
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    NetrunnerApplication* app = netrunner_application_alloc(storage, firmware_api_interface);
+
+    /* Reading and relocating a FAP from the SD card takes a noticeable moment;
+     * cover it with the loading screen instead of a frozen menu. */
+    loading_set_icon(loader->loading, NULL);
+    view_holder_set_view(loader->view_holder, loading_get_view(loader->loading));
+    view_holder_send_to_front(loader->view_holder);
+
+    do {
+        if(!app) {
+            if(error_message) {
+                furi_string_set(error_message, "Failed to allocate FAP loader");
+            }
+            break;
+        }
+
+        FURI_LOG_I(TAG, "Loading FAP %s", path);
+
+        NetrunnerApplicationPreloadStatus preload_status =
+            netrunner_application_preload(app, path);
+
+        if(preload_status != NetrunnerApplicationPreloadStatusSuccess) {
+            const NetrunnerApplicationManifest* manifest = netrunner_application_get_manifest(app);
+            if(error_message) {
+                furi_string_printf(
+                    error_message,
+                    "Preload failed for \"%s\": %s",
+                    manifest->name[0] ? manifest->name : path,
+                    netrunner_application_preload_status_to_string(preload_status));
+            }
+            FURI_LOG_E(
+                TAG,
+                "Preload failed for %s: %s",
+                path,
+                netrunner_application_preload_status_to_string(preload_status));
+
+            if(preload_status == NetrunnerApplicationPreloadStatusApiTooOld ||
+               preload_status == NetrunnerApplicationPreloadStatusApiTooNew) {
+                status = LoaderStatusErrorInternal;
+            }
+            break;
+        }
+
+        const NetrunnerApplicationManifest* fap_manifest = netrunner_application_get_manifest(app);
+        if(fap_manifest->has_icon) {
+            loader_fap_icon_frames[0] = (const uint8_t*)fap_manifest->icon;
+            loading_set_icon(loader->loading, &loader_fap_icon);
+            loading_set_app_icon(&loader_fap_icon);
+        }
+
+        FURI_LOG_I(TAG, "Mapping FAP to memory");
+
+        NetrunnerApplicationLoadStatus load_status =
+            netrunner_application_map_to_memory(app);
+
+        if(load_status != NetrunnerApplicationLoadStatusSuccess) {
+            const char* detail = netrunner_application_get_load_error(app);
+            if(!detail) detail = netrunner_application_load_status_to_string(load_status);
+            if(error_message) {
+                furi_string_printf(
+                    error_message,
+                    "Load failed: %s",
+                    detail);
+            }
+            FURI_LOG_E(
+                TAG,
+                "Load failed for %s: %s",
+                path,
+                detail);
+            break;
+        }
+
+        FURI_LOG_I(TAG, "Starting FAP thread");
+
+        loader->app.fap = app;
+        FuriThread* thread = netrunner_application_alloc_thread(app, args);
+
+        if(!thread) {
+            if(error_message) {
+                furi_string_set(error_message, "Failed to allocate FAP thread");
+            }
+            FURI_LOG_E(TAG, "Failed to allocate thread for %s", path);
+            loader->app.fap = NULL;
+            break;
+        }
+
+        FuriString* app_name = furi_string_alloc();
+        path_extract_filename_no_ext(path, app_name);
+        furi_thread_set_appid(thread, furi_string_get_cstr(app_name));
+        furi_string_free(app_name);
+
+        loader->app.thread = thread;
+
+        /* Start the FAP thread (internal apps use loader_start_app_thread,
+         * but for FAPs we start directly here) */
+        furi_thread_set_state_callback(thread, loader_thread_state_callback);
+        furi_thread_set_state_context(thread, loader);
+        furi_thread_start(thread);
+
+        FURI_LOG_I(TAG, "FAP thread started");
+        status = LoaderStatusOk;
+
+    } while(0);
+
+    /* The app draws its own GUI from here on. */
+    view_holder_set_view(loader->view_holder, NULL);
+    loading_set_icon(loader->loading, NULL);
+
+    if(status != LoaderStatusOk) {
+        loading_set_app_icon(NULL);
+        if(app) {
+            netrunner_application_free(app);
+        }
+    }
+
+    furi_record_close(RECORD_STORAGE);
+    return status;
+}
+
+static void loader_do_menu_show(Loader* loader, bool start_in_settings) {
+    if(!loader->loader_menu) {
+        LoaderEvent event = {.type = LoaderEventTypeMenuOpened};
+        furi_pubsub_publish(loader->pubsub, &event);
+        loader->loader_menu =
+            loader_menu_alloc(loader_menu_closed_callback, loader, start_in_settings);
+    }
+}
+
+static void loader_do_menu_closed(Loader* loader) {
+    if(loader->loader_menu) {
+        loader_menu_free(loader->loader_menu);
+        loader->loader_menu = NULL;
+        LoaderEvent event = {.type = LoaderEventTypeMenuClosed};
+        furi_pubsub_publish(loader->pubsub, &event);
+    }
+}
+
+static void loader_do_applications_show(Loader* loader) {
+    if(!loader->loader_applications) {
+        LoaderEvent event = {.type = LoaderEventTypeApplicationsBrowserOpened};
+        furi_pubsub_publish(loader->pubsub, &event);
+        loader->loader_applications =
+            loader_applications_alloc(loader_applications_closed_callback, loader);
+    }
+}
+
+static void loader_do_applications_closed(Loader* loader) {
+    if(loader->loader_applications) {
+        loader_applications_free(loader->loader_applications);
+        loader->loader_applications = NULL;
+        LoaderEvent event = {.type = LoaderEventTypeApplicationsBrowserClosed};
+        furi_pubsub_publish(loader->pubsub, &event);
+    }
+}
+
+static bool loader_do_is_locked(Loader* loader) {
+    return loader->app.thread != NULL;
+}
+
+/** True for the Dual Boot app by menu name or by .fap path, since it can be
+ * reached either way. */
+static bool loader_name_is_dualboot(const char* name) {
+    if(!name) return false;
+    if(strcmp(name, "Dual Boot") == 0) return true;
+    if(strcmp(name, "dualboot") == 0) return true;
+    /* Path form: match the basename so any apps dir is covered. */
+    const char* base = strrchr(name, '/');
+    base = base ? base + 1 : name;
+    return strcmp(base, "dualboot.fap") == 0;
+}
+
+static LoaderMessageLoaderStatusResult loader_do_start_by_name(
+    Loader* loader,
+    const char* name,
+    const char* args,
+    FuriString* error_message) {
+    LoaderMessageLoaderStatusResult status;
+    status.value = LoaderStatusOk;
+
+    esp_rom_printf("\r\n[LDR] start_by_name name='%s'\r\n", name ? name : "(null)");
+
+    if(name == NULL) return status;
+
+    do {
+        if(loader_do_is_locked(loader)) {
+            status.value = LoaderStatusErrorAppStarted;
+            if(error_message) {
+                furi_string_set(error_message, "Loader is locked");
+            }
+            FURI_LOG_E(TAG, "Loader is locked");
+            break;
+        }
+
+        /* Hiding Dual Boot has to mean unreachable, not merely absent from
+         * the menu: it is still on the card as a .fap and still launchable by
+         * name or path from the file browser, a favourite, an RPC call or a
+         * saved menu. One OK press reboots the board into another firmware,
+         * so for a public build the menu filter alone is not enough. This is
+         * the single choke point every launch goes through. */
+        if(netrunner_settings.hide_dualboot && loader_name_is_dualboot(name)) {
+            status.value = LoaderStatusErrorUnknownApp;
+            if(error_message) {
+                furi_string_set(error_message, "Dual Boot is disabled in settings");
+            }
+            FURI_LOG_W(TAG, "blocked hidden app: %s", name);
+            break;
+        }
+
+        if(strcmp(name, LOADER_APPLICATIONS_NAME) == 0) {
+            loader_do_applications_show(loader);
+            break;
+        }
+
+        LoaderEvent event;
+        event.type = LoaderEventTypeApplicationBeforeLoad;
+        furi_pubsub_publish(loader->pubsub, &event);
+
+        const NetrunnerInternalApplication* app =
+            loader_find_application_by_name(name);
+        esp_rom_printf("[LDR] find_app('%s')=%p\r\n", name, (void*)app);
+        if(app) {
+            esp_rom_printf("[LDR] found name='%s' appid='%s' stack=%u\r\n",
+                app->name, app->appid, (unsigned)app->stack_size);
+            loader_start_internal_app(loader, app, args);
+            break;
+        }
+
+        if(loader_is_external_fap_path(name)) {
+            status.value = loader_start_external_fap(loader, name, args, error_message);
+            break;
+        }
+
+        status.value = LoaderStatusErrorUnknownApp;
+        if(error_message) {
+            furi_string_printf(
+                error_message, "Application \"%s\" not found", name);
+        }
+        FURI_LOG_E(TAG, "Application \"%s\" not found", name);
+    } while(false);
+
+    return status;
+}
+
+static void loader_do_next_deferred_launch(Loader* loader) {
+    if(loader_do_is_locked(loader)) return;
+
+    LoaderDeferredLaunchRecord record;
+    while(loader_queue_pop(&loader->launch_queue, &record)) {
+        FuriString* error_message = furi_string_alloc();
+        FURI_LOG_I(TAG, "Deferred launch: %s", record.name_or_path);
+        LoaderMessageLoaderStatusResult status = loader_do_start_by_name(
+            loader, record.name_or_path, record.args, error_message);
+        if(status.value != LoaderStatusOk) {
+            FURI_LOG_E(TAG, "Deferred start error: %s", furi_string_get_cstr(error_message));
+            if(record.flags & LoaderDeferredLaunchFlagGui) loader_show_gui_error(error_message);
+        }
+        furi_string_free(error_message);
+        loader_queue_item_clear(&record);
+        if(loader_do_is_locked(loader)) return;
+    }
+
+    LoaderEvent event = {.type = LoaderEventTypeNoMoreAppsInQueue};
+    furi_pubsub_publish(loader->pubsub, &event);
+}
+
+static bool loader_do_lock(Loader* loader) {
+    if(loader->app.thread) {
+        return false;
+    }
+    loader->app.thread = (FuriThread*)LOADER_MAGIC_THREAD_VALUE;
+    return true;
+}
+
+static void loader_do_unlock(Loader* loader) {
+    furi_check(loader->app.thread == (FuriThread*)LOADER_MAGIC_THREAD_VALUE);
+    loader->app.thread = NULL;
+}
+
+static void loader_do_app_closed(Loader* loader) {
+    furi_assert(loader->app.thread);
+
+    furi_thread_join(loader->app.thread);
+    FURI_LOG_I(
+        TAG, "App returned: %li", furi_thread_get_return_code(loader->app.thread));
+
+    if(loader->app.args) {
+        free(loader->app.args);
+        loader->app.args = NULL;
+    }
+
+    /* Before freeing the FAP: its manifest backs loader_fap_icon. */
+    loading_set_app_icon(NULL);
+
+    if(loader->app.fap) {
+        netrunner_application_free(loader->app.fap);
+        loader->app.fap = NULL;
+    } else {
+        furi_thread_free(loader->app.thread);
+    }
+    loader->app.thread = NULL;
+
+    FURI_LOG_I(
+        TAG, "Application stopped. Free heap: %zu", memmgr_get_free_heap());
+
+    /* Closed on purpose, so there is nothing to come back to after sleep. */
+    furi_hal_rtc_set_resume_app(NULL);
+
+    /* The menu outlives an app launch, so an app that rewrote the layout — the
+     * Netrunner app's Mainmenu page — would otherwise not be reflected until
+     * the user went back to the desktop and reopened the menu. */
+    loader_menu_reload(loader->loader_menu);
+
+    LoaderEvent event;
+    event.type = LoaderEventTypeApplicationStopped;
+    furi_pubsub_publish(loader->pubsub, &event);
+
+    loader_do_next_deferred_launch(loader);
+}
+
+// app
+
+int32_t loader_srv(void* p) {
+    UNUSED(p);
+    Loader* loader = loader_alloc();
+    furi_record_create(RECORD_LOADER, loader);
+
+    FURI_LOG_I(TAG, "Loader service started");
+
+    /* Reopen whatever idle sleep interrupted.
+     *
+     * This has to happen here, before the message loop, and not from
+     * loader_on_system_start(): the desktop reads loader_is_locked() in
+     * desktop_alloc() to learn an app is already up, and it starts after the
+     * loader, so the app must be running by then. Launching later instead makes
+     * desktop_loader_callback() run, which blocks up to 3 s on a semaphore that
+     * only a running view dispatcher releases — a furi_check, so a crash.
+     *
+     * The HAL only reports a target that was armed by the idle path and woken
+     * from deep sleep, so a deliberate power off or a reboot does not resume. */
+    if(furi_hal_rtc_get_boot_mode() == FuriHalRtcBootModeNormal) {
+        char resume_app[FURI_HAL_RTC_RESUME_APP_SIZE];
+        if(furi_hal_rtc_take_resume_app(resume_app, sizeof(resume_app))) {
+            FURI_LOG_I(TAG, "Resuming after deep sleep: %s", resume_app);
+            loader_do_start_by_name(loader, resume_app, NULL, NULL);
+        }
+    }
+
+    LoaderMessage message;
+    while(true) {
+        if(furi_message_queue_get(loader->queue, &message, FuriWaitForever) ==
+           FuriStatusOk) {
+            switch(message.type) {
+            case LoaderMessageTypeStartByName: {
+                LoaderMessageLoaderStatusResult status = loader_do_start_by_name(
+                    loader,
+                    message.start.name,
+                    message.start.args,
+                    message.start.error_message);
+                *(message.status_value) = status;
+                api_lock_unlock(message.api_lock);
+                break;
+            }
+            case LoaderMessageTypeStartByNameDetachedWithGuiError: {
+                FuriString* error_message = furi_string_alloc();
+                LoaderMessageLoaderStatusResult status = loader_do_start_by_name(
+                    loader,
+                    message.start.name,
+                    message.start.args,
+                    error_message);
+                if(status.value != LoaderStatusOk) {
+                    FURI_LOG_E(
+                        TAG,
+                        "Detached start error: %s",
+                        furi_string_get_cstr(error_message));
+                }
+                if(message.start.name) free((void*)message.start.name);
+                if(message.start.args) free((void*)message.start.args);
+                furi_string_free(error_message);
+                break;
+            }
+            case LoaderMessageTypeShowMenu:
+                loader_do_menu_show(loader, false);
+                break;
+            case LoaderMessageTypeShowSettings: {
+                /* Settings is the Netrunner tree now; open it directly instead of
+                 * the old flat settings submenu. */
+                FuriString* error_message = furi_string_alloc();
+                loader_do_start_by_name(loader, "settings", NULL, error_message);
+                furi_string_free(error_message);
+                break;
+            }
+            case LoaderMessageTypeMenuClosed:
+                loader_do_menu_closed(loader);
+                break;
+            case LoaderMessageTypeApplicationsClosed:
+                loader_do_applications_closed(loader);
+                break;
+            case LoaderMessageTypeIsLocked:
+                message.bool_value->value = loader_do_is_locked(loader);
+                api_lock_unlock(message.api_lock);
+                break;
+            case LoaderMessageTypeAppClosed:
+                loader_do_app_closed(loader);
+                break;
+            case LoaderMessageTypeLock:
+                message.bool_value->value = loader_do_lock(loader);
+                api_lock_unlock(message.api_lock);
+                break;
+            case LoaderMessageTypeUnlock:
+                loader_do_unlock(loader);
+                loader_do_next_deferred_launch(loader);
+                break;
+            case LoaderMessageTypeEnqueueLaunch:
+                furi_check(loader_queue_push(&loader->launch_queue, &message.defer_start));
+                api_lock_unlock(message.api_lock);
+                loader_do_next_deferred_launch(loader);
+                break;
+            }
+        }
+    }
+
+    return 0;
+}
+
+void loader_on_system_start(void) {
+}

@@ -1,0 +1,8 @@
+ADD_SCENE(chameleon_app, connect, Connect)
+ADD_SCENE(chameleon_app, main, Main)
+ADD_SCENE(chameleon_app, device_info, DeviceInfo)
+ADD_SCENE(chameleon_app, slots, Slots)
+ADD_SCENE(chameleon_app, slot_action, SlotAction)
+ADD_SCENE(chameleon_app, reader, Reader)
+ADD_SCENE(chameleon_app, read, Read)
+ADD_SCENE(chameleon_app, save, Save)

@@ -1,0 +1,592 @@
+/**
+ * @file furi_hal_display.c
+ * Display HAL — board-driven configuration via boards/board.h
+ *
+ * Netrunner GUI: 128x64 mono → aspect-fit scaled and centered on display
+ */
+
+#include "furi_hal_display.h"
+#include "furi_hal_light.h"
+#include "furi_hal_resources.h"
+#include "furi_hal_spi_bus.h"
+#include "boards/board.h"
+
+#include <string.h>
+#include <esp_log.h>
+#include <esp_heap_caps.h>
+#include <esp_system.h>
+#include <driver/gpio.h>
+#include <driver/spi_master.h>
+#include <esp_lcd_panel_io.h>
+#include <esp_lcd_panel_vendor.h>
+#include <esp_lcd_panel_ops.h>
+#include <freertos/semphr.h>
+
+static const char* TAG = "FuriHalDisplay";
+
+/* Display dimensions from board config */
+#define LCD_H_RES BOARD_LCD_H_RES
+#define LCD_V_RES BOARD_LCD_V_RES
+
+/* Netrunner framebuffer dimensions */
+#define FB_WIDTH  128
+#define FB_HEIGHT 64
+
+/* Always-on left/right inset (in physical LCD pixels) kept as plain background
+ * color so the UI never sits flush against the screen's left/right edges. A
+ * board may override this in its board.h; otherwise this default applies
+ * everywhere. Set to 0 to disable. */
+#ifndef BOARD_LCD_SIDE_MARGIN
+#define BOARD_LCD_SIDE_MARGIN 4
+#endif
+#define DISPLAY_SIDE_MARGIN BOARD_LCD_SIDE_MARGIN
+
+/* Horizontal resolution actually available to the UI after reserving the
+ * left/right margins. The aspect-fit below scales into this, then the result
+ * is centered across the full LCD resolution — so the leftover on each side
+ * is always >= the margin and is painted with the background color. */
+#define USABLE_H_RES (LCD_H_RES - 2 * DISPLAY_SIDE_MARGIN)
+
+/* Scale the 128x64 framebuffer to the largest centered size that keeps aspect ratio. */
+#if (USABLE_H_RES * FB_HEIGHT) <= (LCD_V_RES * FB_WIDTH)
+#define SCALED_WIDTH  USABLE_H_RES
+#define SCALED_HEIGHT ((USABLE_H_RES * FB_HEIGHT) / FB_WIDTH)
+#else
+#define SCALED_HEIGHT LCD_V_RES
+#define SCALED_WIDTH  ((LCD_V_RES * FB_WIDTH) / FB_HEIGHT)
+#endif
+
+/* Centering margins */
+#define MARGIN_X ((LCD_H_RES - SCALED_WIDTH) / 2)
+#define MARGIN_Y ((LCD_V_RES - SCALED_HEIGHT) / 2)
+
+/* Colors from board config — both are set at runtime so the user can pick
+ * UI Background (fg_color, the field that fills "unset" mono pixels) and
+ * UI Foreground (bg_color, what fills "set" pixels = drawn UI elements). */
+static uint16_t fg_color;
+static uint16_t bg_color;
+
+/* Background gradient. The LUT spans the FULL panel height, not just the
+ * scaled canvas, so the centering margins continue the same ramp instead
+ * of showing a flat band at top and bottom. Rebuilt only when the setting
+ * changes, so rendering costs one array read per row. */
+#define GRAD_LUT_SIZE ((LCD_H_RES) > (LCD_V_RES) ? (LCD_H_RES) : (LCD_V_RES))
+/* RGB565 gives red/blue only 32 levels, so a ramp across ~156 rows lands on
+ * the same packed value for several rows in a row and the steps read as hard
+ * lines. Each ramp position therefore stores 4 ordered-dither variants; the
+ * render picks one by pixel coordinate, which scatters each step boundary
+ * across neighbouring pixels and reads as a smooth blend. Costs one extra
+ * index in the inner loop and 2.5 KB of table. */
+#define GRAD_DITHER 4
+static uint16_t grad_lut[GRAD_LUT_SIZE][GRAD_DITHER];
+static bool grad_enabled = false;
+/* false = ramp runs down the panel (indexed by y), true = across it (by x). */
+static bool grad_horizontal = false;
+
+/* SPI configuration from board config */
+#define LCD_SPI_HOST   BOARD_LCD_SPI_HOST
+#define LCD_SPI_FREQ   BOARD_LCD_SPI_FREQ_HZ
+#define LCD_CMD_BITS   BOARD_LCD_CMD_BITS
+#define LCD_PARAM_BITS BOARD_LCD_PARAM_BITS
+
+/* Stripe-based rendering: render & DMA-send N lines at a time.
+ * Reduces DMA buffer from full-frame (~100KB) to a small stripe (~5KB). */
+#define STRIPE_HEIGHT 8
+
+static esp_lcd_panel_handle_t panel_handle = NULL;
+static esp_lcd_panel_io_handle_t lcd_io_handle = NULL; // kept for runtime MADCTL (colour order)
+static uint16_t* rgb565_buf = NULL; // STRIPE_HEIGHT lines only
+static SemaphoreHandle_t lcd_flush_done = NULL;
+static uint8_t x_scale_lut[SCALED_WIDTH];
+static uint8_t y_scale_lut[SCALED_HEIGHT];
+
+static bool furi_hal_display_flush_done_callback(
+    esp_lcd_panel_io_handle_t panel_io,
+    esp_lcd_panel_io_event_data_t* edata,
+    void* user_ctx) {
+    UNUSED(panel_io);
+    UNUSED(edata);
+    UNUSED(user_ctx);
+
+    BaseType_t yield = pdFALSE;
+    if(lcd_flush_done) {
+        xSemaphoreGiveFromISR(lcd_flush_done, &yield);
+    }
+
+    return yield == pdTRUE;
+}
+
+static void furi_hal_display_prepare_flush(void) {
+    if(!lcd_flush_done) return;
+
+    xSemaphoreTake(lcd_flush_done, 0);
+}
+
+static void furi_hal_display_wait_flush(void) {
+    if(!lcd_flush_done) return;
+
+    if(xSemaphoreTake(lcd_flush_done, pdMS_TO_TICKS(250)) != pdTRUE) {
+        ESP_LOGW(TAG, "Timed out waiting for LCD flush");
+    }
+}
+
+static bool furi_hal_display_send_bitmap(
+    int x_start, int y_start, int x_end, int y_end, const void* pixels) {
+    furi_hal_display_prepare_flush();
+    esp_err_t err = esp_lcd_panel_draw_bitmap(
+        panel_handle, x_start, y_start, x_end, y_end, pixels);
+    if(err != ESP_OK) {
+        /* A failed command queues no colour transfer, hence no completion
+         * callback. Skip this frame and let the next redraw retry. */
+        ESP_LOGW(
+            TAG, "LCD transfer failed: %s; DMA free=%u largest=%u",
+            esp_err_to_name(err), (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+        return false;
+    }
+    furi_hal_display_wait_flush();
+    return true;
+}
+
+static void furi_hal_display_init_scale_lut(void) {
+    for(size_t x = 0; x < SCALED_WIDTH; x++) {
+        x_scale_lut[x] = (x * FB_WIDTH) / SCALED_WIDTH;
+    }
+
+    for(size_t y = 0; y < SCALED_HEIGHT; y++) {
+        y_scale_lut[y] = (y * FB_HEIGHT) / SCALED_HEIGHT;
+    }
+}
+
+static void display_fill_color_rows(uint16_t color, int rows) {
+    uint16_t* line = heap_caps_malloc(LCD_H_RES * sizeof(uint16_t), MALLOC_CAP_DMA);
+    if(!line) return;
+    for(int i = 0; i < LCD_H_RES; i++) line[i] = color;
+    furi_hal_spi_bus_lock();
+    for(int y = 0; y < rows; y++) {
+        if(!furi_hal_display_send_bitmap(0, y, LCD_H_RES, y + 1, line)) break;
+    }
+    furi_hal_spi_bus_unlock();
+    free(line);
+}
+
+
+/* Background color for one panel row: the gradient when enabled, else the
+ * flat UI Background. */
+/* phase = the pixel coordinate along the axis the ramp does NOT run on. */
+static inline uint16_t display_row_color(size_t panel_y, size_t phase) {
+    if(!grad_enabled || grad_horizontal) return fg_color;
+    if(panel_y >= LCD_V_RES) panel_y = LCD_V_RES - 1;
+    return grad_lut[panel_y][phase & (GRAD_DITHER - 1)];
+}
+
+/* Column colour for the horizontal ramp. */
+static inline uint16_t display_col_color(size_t panel_x, size_t phase) {
+    if(!grad_enabled || !grad_horizontal) return fg_color;
+    if(panel_x >= LCD_H_RES) panel_x = LCD_H_RES - 1;
+    return grad_lut[panel_x][phase & (GRAD_DITHER - 1)];
+}
+
+void furi_hal_display_set_bg_gradient(
+    const uint32_t* stops_rgb888, uint8_t count, uint8_t mode, bool horizontal) {
+    /* Fewer than two stops is not a gradient -- fall back to the flat color. */
+    if(!stops_rgb888 || count < 2) {
+        grad_enabled = false;
+        return;
+    }
+    if(count > FURI_HAL_DISPLAY_GRADIENT_MAX_STOPS) {
+        count = FURI_HAL_DISPLAY_GRADIENT_MAX_STOPS;
+    }
+
+    grad_horizontal = horizontal;
+    const size_t extent = horizontal ? LCD_H_RES : LCD_V_RES;
+
+    for(size_t y = 0; y < extent; y++) {
+        /* t = position along the ramp axis, 0..255 fixed point. */
+        uint32_t t = (extent > 1) ? (uint32_t)(y * 255U) / (extent - 1) : 0;
+
+        if(mode == FuriHalDisplayGradientMirror) {
+            /* Ramp down to the middle and back, so top and bottom edges match. */
+            t = (t <= 127) ? (t * 2) : ((255 - t) * 2);
+            if(t > 255) t = 255;
+        }
+
+        uint8_t r, g, b;
+        if(mode == FuriHalDisplayGradientBands) {
+            /* Hard steps: N equal bands, no blending at all. */
+            uint32_t idx = (t * count) / 256;
+            if(idx >= count) idx = count - 1;
+            uint32_t c = stops_rgb888[idx];
+            r = (c >> 16) & 0xFF;
+            g = (c >> 8) & 0xFF;
+            b = c & 0xFF;
+        } else {
+            uint32_t span = count - 1;    /* number of segments */
+            uint32_t pos = t * span;      /* 0 .. 255*span */
+            uint32_t i = pos / 256;
+            if(i >= span) i = span - 1;
+            uint32_t f = pos - (i * 256); /* blend factor in segment, 0..255 */
+            if(f > 255) f = 255;
+
+            if(mode == FuriHalDisplayGradientSmooth) {
+                /* smoothstep f^2*(3-2f): colors linger near each stop. */
+                f = (f * f * (3 * 255 - 2 * f)) / (255 * 255);
+                if(f > 255) f = 255;
+            }
+
+            uint32_t c0 = stops_rgb888[i];
+            uint32_t c1 = stops_rgb888[i + 1];
+            r = (uint8_t)((((c0 >> 16) & 0xFF) * (255 - f) + ((c1 >> 16) & 0xFF) * f) / 255);
+            g = (uint8_t)((((c0 >> 8) & 0xFF) * (255 - f) + ((c1 >> 8) & 0xFF) * f) / 255);
+            b = (uint8_t)(((c0 & 0xFF) * (255 - f) + (c1 & 0xFF) * f) / 255);
+        }
+        /* Ordered dither: nudge each channel by a fraction of one
+         * quantisation step before packing. Red/blue quantise to 8/255,
+         * green to 4/255, so the offsets are scaled per channel. */
+        static const uint8_t bayer[GRAD_DITHER] = {0, 2, 1, 3};
+        for(size_t d = 0; d < GRAD_DITHER; d++) {
+            uint32_t rd = r + bayer[d] * 2; /* 5-bit channel: step 8 -> 0,4,2,6 */
+            uint32_t gd = g + bayer[d];     /* 6-bit channel: step 4 -> 0,2,1,3 */
+            uint32_t bd = b + bayer[d] * 2;
+            if(rd > 255) rd = 255;
+            if(gd > 255) gd = 255;
+            if(bd > 255) bd = 255;
+            grad_lut[y][d] = furi_hal_display_color565_swap((uint8_t)rd, (uint8_t)gd, (uint8_t)bd);
+        }
+    }
+    grad_enabled = true;
+}
+
+/* Paint a rectangle with the background: one gradient row per line when the
+ * gradient is on, otherwise a flat fill. Chunks vertically at STRIPE_HEIGHT to stay
+ * within the buffer capacity. Caller must hold the SPI bus lock. */
+static void display_paint_bg_rect(size_t x, size_t y, size_t w, size_t h) {
+    if(w == 0 || h == 0 || w > LCD_H_RES) return;
+
+    for(size_t y_off = 0; y_off < h; y_off += STRIPE_HEIGHT) {
+        size_t chunk_h = h - y_off;
+        if(chunk_h > STRIPE_HEIGHT) chunk_h = STRIPE_HEIGHT;
+
+        for(size_t row = 0; row < chunk_h; row++) {
+            uint16_t* dst = &rgb565_buf[row * w];
+            const size_t panel_y = y + y_off + row;
+            if(grad_enabled && grad_horizontal) {
+                /* Ramp varies across the row; dither phase comes from y. */
+                for(size_t i = 0; i < w; i++) {
+                    dst[i] = display_col_color(x + i, panel_y);
+                }
+            } else if(grad_enabled) {
+                for(size_t i = 0; i < w; i++) {
+                    dst[i] = display_row_color(panel_y, x + i);
+                }
+            } else {
+                for(size_t i = 0; i < w; i++) dst[i] = fg_color;
+            }
+        }
+
+        if(!furi_hal_display_send_bitmap(
+               x, y + y_off, x + w, y + y_off + chunk_h, rgb565_buf)) break;
+    }
+}
+
+void furi_hal_display_init(void) {
+    ESP_LOGI(TAG, "Initializing display for %s", BOARD_NAME);
+
+    /* Force the backlight OFF before touching the panel. A reboot (esp_restart)
+     * does NOT power-cycle the ST7789: it comes into early boot still lit and
+     * still holding the previous frame (the red UI). Resetting + re-initialising
+     * the panel briefly scans that old frame with the boot-default colour order,
+     * i.e. red shown as blue — the quick blue screen after a reboot. Keeping the
+     * backlight dark until the panel has been cleared to black (furi_hal_light_init
+     * runs AFTER this and lights it) makes that re-init flicker invisible.
+     * GPIO21 here is the backlight only (PWR_EN is GPIO15) — safe to drive low. */
+    gpio_config_t bl_cfg = {
+        .pin_bit_mask = 1ULL << gpio_lcd_bl.pin,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&bl_cfg);
+    gpio_set_level((gpio_num_t)gpio_lcd_bl.pin, BOARD_LCD_BL_ACTIVE_LOW ? 1 : 0); /* off */
+
+    furi_hal_spi_bus_init();
+    if(!lcd_flush_done) {
+        lcd_flush_done = xSemaphoreCreateBinary();
+        ESP_ERROR_CHECK(lcd_flush_done ? ESP_OK : ESP_ERR_NO_MEM);
+    }
+
+    /* Initialize SPI bus */
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = gpio_lcd_din.pin,
+        .miso_io_num = gpio_sdcard_miso.pin,
+        .sclk_io_num = gpio_lcd_clk.pin,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = LCD_H_RES * STRIPE_HEIGHT * sizeof(uint16_t),
+    };
+    esp_err_t spi_err = spi_bus_initialize(LCD_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+    /* ESP_ERR_INVALID_STATE is OK — bus may already be initialized by SubGHz on shared-bus boards */
+    if(spi_err != ESP_OK && spi_err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(spi_err);
+    }
+
+    /* Create panel IO (SPI) */
+    esp_lcd_panel_io_handle_t io_handle = NULL;
+    esp_lcd_panel_io_spi_config_t io_config = {
+        .dc_gpio_num = gpio_lcd_dc.pin,
+        .cs_gpio_num = gpio_lcd_cs.pin,
+        .pclk_hz = LCD_SPI_FREQ,
+        .lcd_cmd_bits = LCD_CMD_BITS,
+        .lcd_param_bits = LCD_PARAM_BITS,
+        .spi_mode = 0,
+        .trans_queue_depth = 1,
+        .on_color_trans_done = furi_hal_display_flush_done_callback,
+        .user_ctx = NULL,
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(LCD_SPI_HOST, &io_config, &io_handle));
+
+    /* Create ST7789 panel */
+    esp_lcd_panel_dev_config_t panel_config = {
+        .reset_gpio_num = gpio_lcd_rst.pin,
+#if defined(BOARD_LCD_COLOR_ORDER_BGR) && BOARD_LCD_COLOR_ORDER_BGR
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
+#else
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+#endif
+        .bits_per_pixel = 16,
+    };
+    /* Use the driver's single reset sequence so boot does not spend extra time black. */
+    lcd_io_handle = io_handle; // retained so the colour order can be flipped at runtime
+    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+
+    /* Display orientation and corrections from board config (these (re)write
+     * MADCTL with our colour order + mirror/swap bits, and INVON/INVOFF). */
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, BOARD_LCD_INVERT_COLOR));
+    ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel_handle, BOARD_LCD_SWAP_XY));
+    ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_handle, BOARD_LCD_MIRROR_X, BOARD_LCD_MIRROR_Y));
+    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_handle, BOARD_LCD_GAP_X, BOARD_LCD_GAP_Y));
+
+    /* Pin down pixel format + normal display mode.
+     *    COLMOD 0x55 = 16 bits/pixel (RGB565) — matches bits_per_pixel=16 above;
+     *    NORON (0x13) = normal display mode (not partial/idle). Both are no-ops
+     *    when the state is already right and cost nothing. */
+    {
+        const uint8_t colmod = 0x55;
+        ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, 0x3A /* COLMOD */, &colmod, 1));
+    }
+    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, 0x13 /* NORON */, NULL, 0));
+
+    /* Boot NEUTRAL: display init runs in furi_hal_init_early(), before NVS and
+     * storage are up, so the per-unit red/blue (MADCTL) order cannot be read
+     * yet and is still the compile-time default. Painting the themed colour now
+     * would show it with the wrong order on a unit whose saved order differs
+     * (red rendered as blue, etc.). Black (BOARD_LCD_BG_COLOR) is order-neutral,
+     * so the boot screen stays correct until the notification service applies
+     * the saved order and then the themed colour. */
+    fg_color = BOARD_LCD_BG_COLOR;
+    bg_color = BOARD_LCD_BG_COLOR;
+
+    furi_hal_display_init_scale_lut();
+
+    /* Allocate DMA-capable RGB565 stripe buffer (STRIPE_HEIGHT lines only).
+     * Sized to the full LCD width so the same scratch buffer can paint the
+     * full-width top/bottom margin strips as well as the scaled UI stripes. */
+    size_t stripe_bytes = LCD_H_RES * STRIPE_HEIGHT * sizeof(uint16_t);
+    rgb565_buf = heap_caps_malloc(stripe_bytes, MALLOC_CAP_DMA);
+    if(!rgb565_buf) {
+        ESP_LOGE(TAG, "Failed to allocate RGB565 stripe buffer (%d bytes)",
+                 (int)stripe_bytes);
+        return;
+    }
+
+    /* Clear the ENTIRE controller GRAM to black while the panel is still OFF.
+     * A reboot does not wipe the ST7789 GRAM, so the previous frame (the red UI)
+     * is still in there. A plain visible-window clear leaves the off-screen gap
+     * rows untouched, and with this panel's vertical gap a hair off, a band of
+     * those old rows peeks in at the BASE — scanned with the boot-default order
+     * it shows as a blue strip on reboot. So we drop the gap to zero and clear
+     * the full addressable height (visible + both gap bands), then restore the
+     * gap. Done before disp-on, so the very first scan is uniformly black. */
+    esp_lcd_panel_set_gap(panel_handle, 0, 0);
+    display_fill_color_rows(fg_color, LCD_V_RES + 2 * BOARD_LCD_GAP_Y);
+    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_handle, BOARD_LCD_GAP_X, BOARD_LCD_GAP_Y));
+
+    /* Now turn the display on: the first thing scanned out is the black clear. */
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
+
+    ESP_LOGI(TAG, "Display initialized (%dx%d, scaled %dx%d, stripe=%d lines, buf=%d bytes)",
+             FB_WIDTH, FB_HEIGHT, SCALED_WIDTH, SCALED_HEIGHT, STRIPE_HEIGHT, (int)stripe_bytes);
+}
+
+void furi_hal_display_commit(const uint8_t* data, uint32_t size) {
+    UNUSED(size);
+    if(!panel_handle || !rgb565_buf || !data) return;
+
+    /*
+     * Stripe-based rendering: render STRIPE_HEIGHT lines into the small DMA
+     * buffer, send via SPI, then render the next stripe.
+     * Saves ~95KB of internal DMA-capable SRAM.
+     *
+     * u8g2 tile buffer layout:
+     * 8 pages of 128 bytes each (128 columns × 8 pages = 1024 bytes)
+     * Byte at [page * 128 + x]: bit n = pixel at (x, page*8 + n)
+     * Bit 0 = top pixel in tile, bit 7 = bottom pixel in tile
+     */
+    furi_hal_spi_bus_lock();
+
+    /* Repaint the margin strips with the current fg_color every frame so the
+     * entire screen tracks UI Color changes. Without this the init-time fill
+     * persists and the margins keep showing the boot-time orange while the
+     * central framebuffer area updates.
+     *
+     * Top/bottom strips span the full width; left/right strips (the always-on
+     * DISPLAY_SIDE_MARGIN inset, plus any extra from aspect-fit centering) span
+     * only the height of the scaled image so they don't overdraw the corners. */
+    if(MARGIN_Y > 0) {
+        display_paint_bg_rect(0, 0, LCD_H_RES, MARGIN_Y);
+        display_paint_bg_rect(
+            0, MARGIN_Y + SCALED_HEIGHT,
+            LCD_H_RES, LCD_V_RES - MARGIN_Y - SCALED_HEIGHT);
+    }
+    if(MARGIN_X > 0) {
+        display_paint_bg_rect(0, MARGIN_Y, MARGIN_X, SCALED_HEIGHT);
+        display_paint_bg_rect(
+            MARGIN_X + SCALED_WIDTH, MARGIN_Y,
+            LCD_H_RES - MARGIN_X - SCALED_WIDTH, SCALED_HEIGHT);
+    }
+
+    for(size_t stripe_y = 0; stripe_y < SCALED_HEIGHT; stripe_y += STRIPE_HEIGHT) {
+        size_t stripe_h = STRIPE_HEIGHT;
+        if(stripe_y + stripe_h > SCALED_HEIGHT) {
+            stripe_h = SCALED_HEIGHT - stripe_y;
+        }
+
+        /* Render stripe into buffer */
+        for(size_t row = 0; row < stripe_h; row++) {
+            const size_t sy = stripe_y + row;
+            const uint8_t mono_y = y_scale_lut[sy];
+            const size_t page = mono_y >> 3;
+            const uint8_t bit_mask = 1U << (mono_y & 0x07);
+            uint16_t* dst = &rgb565_buf[row * SCALED_WIDTH];
+            /* Vertical ramp is one lookup per row; horizontal needs one per
+             * column, which is the same cost as the x_scale_lut read already
+             * in this loop. */
+            const size_t panel_y = MARGIN_Y + sy;
+            if(grad_enabled && grad_horizontal) {
+                for(size_t sx = 0; sx < SCALED_WIDTH; sx++) {
+                    const uint8_t mono_x = x_scale_lut[sx];
+                    const bool pixel_set = (data[page * FB_WIDTH + mono_x] & bit_mask) != 0;
+                    dst[sx] = pixel_set ? bg_color :
+                                          grad_lut[MARGIN_X + sx][panel_y & (GRAD_DITHER - 1)];
+                }
+            } else if(grad_enabled) {
+                /* Row is fixed, so the dither phase is the x coordinate. */
+                const uint16_t* row_ramp = grad_lut[panel_y];
+                for(size_t sx = 0; sx < SCALED_WIDTH; sx++) {
+                    const uint8_t mono_x = x_scale_lut[sx];
+                    const bool pixel_set = (data[page * FB_WIDTH + mono_x] & bit_mask) != 0;
+                    dst[sx] = pixel_set ? bg_color : row_ramp[sx & (GRAD_DITHER - 1)];
+                }
+            } else {
+                for(size_t sx = 0; sx < SCALED_WIDTH; sx++) {
+                    const uint8_t mono_x = x_scale_lut[sx];
+                    const bool pixel_set = (data[page * FB_WIDTH + mono_x] & bit_mask) != 0;
+                    dst[sx] = pixel_set ? bg_color : fg_color;
+                }
+            }
+        }
+
+        /* DMA send this stripe */
+        if(!furi_hal_display_send_bitmap(
+               MARGIN_X, MARGIN_Y + stripe_y,
+               MARGIN_X + SCALED_WIDTH, MARGIN_Y + stripe_y + stripe_h,
+               rgb565_buf)) break;
+    }
+
+    furi_hal_spi_bus_unlock();
+}
+
+void furi_hal_display_set_backlight(uint8_t brightness) {
+    furi_hal_light_set(LightBacklight, brightness);
+}
+
+void furi_hal_display_sleep(void) {
+    if(!panel_handle) return;
+    furi_hal_spi_bus_lock();
+    /* SLPIN: stop the panel's internal oscillator/booster to cut idle current */
+    esp_lcd_panel_disp_on_off(panel_handle, false);
+    furi_hal_spi_bus_unlock();
+}
+
+uint16_t furi_hal_display_get_h_res(void) {
+    return LCD_H_RES;
+}
+
+uint16_t furi_hal_display_get_v_res(void) {
+    return LCD_V_RES;
+}
+
+esp_lcd_panel_handle_t furi_hal_display_get_panel_handle(void) {
+    return panel_handle;
+}
+
+void furi_hal_display_blit_rgb565(
+    uint16_t x,
+    uint16_t y,
+    uint16_t width,
+    uint16_t height,
+    const uint16_t* data) {
+    if(!panel_handle || !rgb565_buf || !data || !width || !height) return;
+    if(x >= LCD_H_RES || y >= LCD_V_RES) return;
+    if((uint32_t)x + width > LCD_H_RES || (uint32_t)y + height > LCD_V_RES) return;
+
+    furi_hal_spi_bus_lock();
+    for(uint16_t row = 0; row < height; row += STRIPE_HEIGHT) {
+        uint16_t rows = STRIPE_HEIGHT;
+        if(row + rows > height) rows = height - row;
+
+        memcpy(
+            rgb565_buf,
+            &data[(size_t)row * width],
+            (size_t)width * rows * sizeof(uint16_t));
+
+        if(!furi_hal_display_send_bitmap(
+               x, y + row, x + width, y + row + rows, rgb565_buf)) break;
+    }
+    furi_hal_spi_bus_unlock();
+}
+
+void furi_hal_display_set_fg_color(uint16_t color) {
+    fg_color = color;
+}
+
+uint16_t furi_hal_display_get_fg_color(void) {
+    return fg_color;
+}
+
+void furi_hal_display_set_bg_color(uint16_t color) {
+    bg_color = color;
+}
+
+uint16_t furi_hal_display_get_bg_color(void) {
+    return bg_color;
+}
+
+/* Runtime red/blue order. LilyGo T-Embed panels vary by batch: some are wired
+ * RGB, some BGR, so the right MADCTL colour-order bit differs per unit. The
+ * whole pipeline packs standard RGB565, so bgr=false is "normal"; a unit that
+ * shows red<->blue swapped needs bgr=true (or vice-versa).
+ *
+ * Only the MADCTL colour-order bit (0x08) changes here. The orientation bits
+ * are fixed by this board (swap_xy -> MV 0x20, mirror_y -> MY 0x80), so the
+ * byte is 0xA0 (RGB) or 0xA8 (BGR); flipping 0x08 never rotates/mirrors. */
+void furi_hal_display_set_bgr_order(bool bgr) {
+    if(!lcd_io_handle) return;
+    const uint8_t madctl = (uint8_t)(0xA0 | (bgr ? 0x08 : 0x00));
+    furi_hal_spi_bus_lock();
+    esp_lcd_panel_io_tx_param(lcd_io_handle, 0x36 /* MADCTL */, &madctl, 1);
+    furi_hal_spi_bus_unlock();
+}

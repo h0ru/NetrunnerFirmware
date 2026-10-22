@@ -1,0 +1,13 @@
+App(
+    appid="netfetch",
+    name="Netfetch",
+    apptype=NetrunnerAppType.MENUEXTERNAL,
+    entry_point="netfetch_app",
+    requires=[
+        "gui",
+    ],
+    stack_size=2 * 1024,
+    icon="A_Netfetch_14",
+    order=92,
+    fap_category="Tools",
+)

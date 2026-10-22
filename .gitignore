@@ -1,0 +1,50 @@
+# --- Build output ---
+build/
+build_*/
+.pio/
+managed_components/
+dist/
+*.o
+*.a
+*.elf
+*.bin.bak
+
+# --- ESP-IDF / project local config ---
+sdkconfig
+sdkconfig.old
+dependencies.lock.local
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- Android / Gradle (companion build artifacts) ---
+local.properties
+*.keystore
+*.jks
+.gradle/
+
+# --- Secrets / credentials (never publish) ---
+.env
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+.netrc
+.npmrc
+.git-credentials
+secrets.*
+
+# --- Editor / OS ---
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/

@@ -1,0 +1,25 @@
+App(
+    appid="main_apps",
+    name="Basic applications for main menu",
+    apptype=NetrunnerAppType.METAPACKAGE,
+    provides=[
+        "infrared",
+        "nfc",
+        "subghz",
+        "wardriving",
+        "bad_usb",
+        "archive",
+        "clock",
+        "subghz_remote",
+        "main_apps_on_start",
+    ],
+)
+
+App(
+    appid="main_apps_on_start",
+    name="On start hooks",
+    apptype=NetrunnerAppType.METAPACKAGE,
+    provides=[
+        "cli",
+    ],
+)

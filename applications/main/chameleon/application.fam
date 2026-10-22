@@ -1,0 +1,10 @@
+App(
+    appid="chameleon",
+    name="Chameleon",
+    apptype=NetrunnerAppType.MENUEXTERNAL,
+    entry_point="chameleon_app",
+    stack_size=4 * 1024,
+    icon="A_Chameleon_14",
+    order=69,
+    fap_libs=["assets"],
+)
